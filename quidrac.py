@@ -107,6 +107,10 @@ DEFAULT_USER = None                # e.g. "root"
 DEFAULT_PASSWORD = None            # prefer the IPMI_PASSWORD env var over hardcoding here
 
 DEFAULT_SENSORS = "0Eh,0Fh"        # Sensor IDs to monitor (see `ipmitool sdr list`)
+SENSOR_ALIASES = {                 # Friendly names shown in the dashboard and logs.
+    "0Eh": "CPU1",                 # Script-only setting: edit here to match your
+    "0Fh": "CPU2",                 # system. Sensors without an entry show their raw ID.
+}
 DEFAULT_POLL_INTERVAL = 10         # Seconds between polls
 
 DEFAULT_BASE_SPEED = 30            # Minimum fan speed (%), used at/below target temp
@@ -202,11 +206,12 @@ class SharedState:
     override file web-UI changes are persisted to. Reverting restores
     the baseline and removes the file."""
 
-    def __init__(self, params, baseline, settings_path, demo=False):
+    def __init__(self, params, baseline, settings_path, aliases=None, demo=False):
         self._lock = threading.Lock()
         self._params = validate_params(params)
         self._baseline = validate_params(baseline)
         self.settings_path = settings_path
+        self.aliases = dict(aliases or {})  # sensor_id (lowercase) -> display name
         self._history = deque(maxlen=HISTORY_MAX_SAMPLES)
         self._status = {
             "state": "starting",
@@ -287,6 +292,7 @@ class SharedState:
                 "samples": samples,
                 "settings_file": os.path.basename(self.settings_path),
                 "overrides_active": self._params != self._baseline,
+                "aliases": dict(self.aliases),
             }
 
 
@@ -448,6 +454,10 @@ class CurveController:
 # Control loop
 # ---------------------------------------------------------------------------
 
+def fmt_readings(readings, aliases):
+    return ", ".join(f"{aliases.get(sid, sid)}={v}C" for sid, v in readings.items())
+
+
 def run_loop(ipmi, controller, state, sensor_ids):
     consecutive_failures = 0
     failsafe = False           # too many failures; trying to hand back to iDRAC
@@ -501,7 +511,7 @@ def run_loop(ipmi, controller, state, sensor_ids):
                     f"at control temp {controller.control_temp}C).")
                 last_speed = speed
 
-            log(f"Readings: {readings} | max={max_temp}C | "
+            log(f"Readings: {fmt_readings(readings, state.aliases)} | max={max_temp}C | "
                 f"control={controller.control_temp}C | speed={speed}%")
 
         except Exception as e:
@@ -825,10 +835,11 @@ th:first-child, td:first-child { text-align: left; }
 <script>
 "use strict";
 const S = {
-  samples: [], params: null, spec: null, status: null,
+  samples: [], params: null, spec: null, status: null, aliases: {},
   lastT: 0, now: 0, win: 3600, hoverT: null, tableOn: false,
   sensorIds: [], connected: false, formDirty: false, formBuilt: false,
 };
+const aliasOf = sid => S.aliases[sid] || sid;
 const MAXWIN = 86400;
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const SENSOR_VARS = ["--s1", "--s2", "--s3", "--s4"];
@@ -844,6 +855,7 @@ async function poll() {
     const j = await r.json();
     S.params = j.params; S.spec = j.param_spec; S.status = j.status; S.now = j.now;
     S.settingsFile = j.settings_file; S.overridesActive = j.overrides_active;
+    S.aliases = j.aliases || {};
     if (j.samples.length) {
       S.samples.push(...j.samples);
       S.lastT = j.samples[j.samples.length - 1].t;
@@ -883,7 +895,7 @@ function render() {
     $("tSpeedNote").textContent = "curve asks " + last.curve + "%";
     const hot = S.sensorIds.reduce((a, b) => (last.temps[a] >= last.temps[b] ? a : b));
     $("tMax").textContent = fmtTemp(last.max);
-    $("tMaxNote").textContent = "sensor " + hot;
+    $("tMaxNote").textContent = aliasOf(hot);
     $("tCtrl").textContent = fmtTemp(last.ctrl);
     const head = last.cap - last.max;
     $("tHead").textContent = head + "°C";
@@ -1037,7 +1049,7 @@ function drawChart(canvas, seriesList, yLo, yHi, unit) {
 
 function tempSeries() {
   const list = S.sensorIds.map((sid, i) => ({
-    name: sid, color: sensorColor(i), width: 2, marker: true, get: r => r.temps[sid] ?? null,
+    name: aliasOf(sid), color: sensorColor(i), width: 2, marker: true, get: r => r.temps[sid] ?? null,
   }));
   list.push({ name: "control temp", color: css("--ctrl"), width: 2, dash: [2, 4], marker: false, get: r => r.ctrl });
   list.push({ name: "target", color: css("--muted"), width: 1.5, dash: [5, 4], get: r => r.target });
@@ -1144,7 +1156,7 @@ function renderTable() {
   const thead = $("stable").querySelector("thead");
   const tbody = $("stable").querySelector("tbody");
   const tr = document.createElement("tr");
-  for (const htext of ["Time", ...S.sensorIds.map(s => s + " °C"), "Control °C", "Speed %", "Curve %", "Target °C", "Cap °C"]) {
+  for (const htext of ["Time", ...S.sensorIds.map(s => aliasOf(s) + " °C"), "Control °C", "Speed %", "Curve %", "Target °C", "Cap °C"]) {
     const th = document.createElement("th"); th.textContent = htext; tr.append(th);
   }
   thead.replaceChildren(tr);
@@ -1359,8 +1371,9 @@ def main():
     except ValueError as e:
         parser.error(str(e))
     params = load_settings_file(settings_path, cli_params)
-    state = SharedState(params, baseline=cli_params,
-                        settings_path=settings_path, demo=args.demo)
+    aliases = {k.lower(): v for k, v in SENSOR_ALIASES.items()}
+    state = SharedState(params, baseline=cli_params, settings_path=settings_path,
+                        aliases=aliases, demo=args.demo)
     controller = CurveController(state)
 
     def handle_shutdown(signum, frame):
