@@ -58,10 +58,13 @@ WEB INTERFACE:
   target/hard-cap thresholds, and fan speed, plus a form to tweak every
   control parameter at runtime. Parameter changes apply on the next
   poll and are saved to a settings file (default: quidrac-settings.json
-  next to this script; override with --settings-file) that takes
-  precedence over CLI flags/defaults at startup. "Restore script
-  settings" in the UI returns to the CLI/default values and removes the
-  file. There is no authentication: bind it to a trusted network only
+  next to this script; override with --settings-file). At startup,
+  settings resolve lowest-to-highest: script defaults -> settings file
+  -> CLI flags you explicitly pass (an explicit flag is an explicit
+  request, so it outranks the saved file). "Restore script settings" in
+  the UI returns to the launch configuration (defaults + explicit
+  flags) and removes the file. There is no authentication: bind it to a
+  trusted network only
   (--web-bind, default 0.0.0.0; --web-port, default 8080; --no-web to
   disable).
 
@@ -108,8 +111,8 @@ DEFAULT_PASSWORD = None            # prefer the IPMI_PASSWORD env var over hardc
 
 DEFAULT_SENSORS = "0Eh,0Fh"        # Sensor IDs to monitor (see `ipmitool sdr list`)
 SENSOR_ALIASES = {                 # Friendly names shown in the dashboard and logs.
-    "0Eh": "CPU1",                 # Script-only setting: edit here to match your
-    "0Fh": "CPU2",                 # system. Sensors without an entry show their raw ID.
+    "0Eh": "CPU1",                 # Edit here or pass --sensor-aliases "0Eh=CPU1,..."
+    "0Fh": "CPU2",                 # (flag entries win). Unlisted sensors show their raw ID.
 }
 DEFAULT_POLL_INTERVAL = 10         # Seconds between polls
 
@@ -153,28 +156,36 @@ PARAM_SPEC = {
 }
 
 
-def load_settings_file(path, cli_params):
-    """Merge saved web-UI overrides from `path` over the CLI/default
-    params. Returns the effective params; falls back to cli_params (with
-    a warning) if the file is missing keys' worth of sanity or unreadable."""
+def read_settings_overrides(path):
+    """Read saved web-UI parameter overrides from `path`. Returns a dict
+    holding PARAM_SPEC keys only ({} if the file is absent); a malformed
+    or unreadable file logs a warning and is ignored."""
     if not os.path.exists(path):
-        return cli_params
+        return {}
     try:
         with open(path) as f:
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("not a JSON object")
-        overrides = {k: v for k, v in data.items() if k in PARAM_SPEC}
-        merged = validate_params({**cli_params, **overrides})
-        changed = [f"{n}={merged[n]}" for n in PARAM_SPEC if merged[n] != cli_params[n]]
-        if changed:
-            log(f"Loaded settings overrides from {path}: {', '.join(changed)} "
-                f"(web-UI 'Restore script settings' or deleting the file reverts).")
-        return merged
+        return {k: v for k, v in data.items() if k in PARAM_SPEC}
     except (OSError, ValueError, json.JSONDecodeError) as e:
-        log(f"Ignoring settings file {path}: {e}. Using CLI flags/defaults.",
-            level="WARNING")
-        return cli_params
+        log(f"Ignoring settings file {path}: {e}.", level="WARNING")
+        return {}
+
+
+def parse_sensor_aliases(text):
+    """Parse a --sensor-aliases value like '0Eh=CPU1,0Fh=CPU2' into
+    {sensor_id_lowercase: display_name}. Raises ValueError on bad entries."""
+    out = {}
+    for entry in text.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        sid, sep, name = entry.partition("=")
+        if not sep or not sid.strip() or not name.strip():
+            raise ValueError(f"bad --sensor-aliases entry {entry!r}; expected ID=NAME")
+        out[sid.strip().lower()] = name.strip()
+    return out
 
 
 def validate_params(params):
@@ -1297,28 +1308,37 @@ def main():
 
     parser.add_argument("--sensors", default=DEFAULT_SENSORS,
                         help=f"Comma-separated sensor IDs to monitor (default: {DEFAULT_SENSORS})")
-    parser.add_argument("--poll-interval", type=int, default=DEFAULT_POLL_INTERVAL,
-                        help="Seconds between polls")
+    parser.add_argument("--sensor-aliases", default=None,
+                        help='Friendly sensor names as comma-separated ID=NAME pairs, '
+                             'e.g. "0Eh=CPU1,0Fh=CPU2". Merged over the SENSOR_ALIASES '
+                             'dict in this script (flag wins per sensor).')
 
-    parser.add_argument("--base-speed", type=int, default=DEFAULT_BASE_SPEED,
-                        help="Minimum fan speed %%, used at/below --target-temp")
-    parser.add_argument("--target-temp", type=float, default=DEFAULT_TARGET_TEMP,
-                        help="Curve start (C): at/below this temp fans run at --base-speed")
-    parser.add_argument("--hard-cap-temp", type=float, default=DEFAULT_HARD_CAP_TEMP,
-                        help="Curve end (C): at/above this temp fans jump to --max-speed")
-    parser.add_argument("--max-speed", type=int, default=DEFAULT_MAX_SPEED,
-                        help="Maximum fan speed %%")
-    parser.add_argument("--fall-rate", type=float, default=DEFAULT_FALL_RATE,
-                        help="Max fan speed decrease per poll when cooling (%%/poll). "
-                             "Rises are always instant.")
-    parser.add_argument("--temp-hysteresis", type=float, default=DEFAULT_TEMP_HYSTERESIS,
-                        help="Temp must fall this many degrees below its recent peak "
-                             "before fans follow it down (C). Prevents fan bounce from "
-                             "1C sensor flicker; 0 disables.")
-
-    parser.add_argument("--max-failed-polls", type=int, default=DEFAULT_MAX_FAILED_POLLS,
-                        help="Consecutive failed polls before the failsafe reverts "
-                             "iDRAC to automatic fan control")
+    # The eight tunable parameters use default=argparse.SUPPRESS so we can
+    # tell "explicitly passed" apart from "left at default": explicit flags
+    # outrank the settings file, script defaults sit below it.
+    parser.add_argument("--poll-interval", type=int, default=argparse.SUPPRESS,
+                        help=f"Seconds between polls (default: {DEFAULT_POLL_INTERVAL})")
+    parser.add_argument("--base-speed", type=int, default=argparse.SUPPRESS,
+                        help=f"Minimum fan speed %%, used at/below --target-temp "
+                             f"(default: {DEFAULT_BASE_SPEED})")
+    parser.add_argument("--target-temp", type=float, default=argparse.SUPPRESS,
+                        help=f"Curve start (C): at/below this temp fans run at "
+                             f"--base-speed (default: {DEFAULT_TARGET_TEMP})")
+    parser.add_argument("--hard-cap-temp", type=float, default=argparse.SUPPRESS,
+                        help=f"Curve end (C): at/above this temp fans jump to "
+                             f"--max-speed (default: {DEFAULT_HARD_CAP_TEMP})")
+    parser.add_argument("--max-speed", type=int, default=argparse.SUPPRESS,
+                        help=f"Maximum fan speed %% (default: {DEFAULT_MAX_SPEED})")
+    parser.add_argument("--fall-rate", type=float, default=argparse.SUPPRESS,
+                        help=f"Max fan speed decrease per poll when cooling (%%/poll). "
+                             f"Rises are always instant. (default: {DEFAULT_FALL_RATE})")
+    parser.add_argument("--temp-hysteresis", type=float, default=argparse.SUPPRESS,
+                        help=f"Temp must fall this many degrees below its recent peak "
+                             f"before fans follow it down (C). Prevents fan bounce from "
+                             f"1C sensor flicker; 0 disables. (default: {DEFAULT_TEMP_HYSTERESIS})")
+    parser.add_argument("--max-failed-polls", type=int, default=argparse.SUPPRESS,
+                        help=f"Consecutive failed polls before the failsafe reverts "
+                             f"iDRAC to automatic fan control (default: {DEFAULT_MAX_FAILED_POLLS})")
     parser.add_argument("--revert-on-exit", dest="revert_on_exit", action="store_true",
                         default=DEFAULT_REVERT_ON_EXIT,
                         help="Revert to automatic iDRAC fan control on exit (default: on)")
@@ -1330,8 +1350,9 @@ def main():
 
     parser.add_argument("--settings-file", default=None,
                         help=f"Path where web-UI parameter changes are saved and, if "
-                             f"present at startup, override CLI flags/defaults "
-                             f"(default: {SETTINGS_FILENAME} next to this script)")
+                             f"present at startup, override script defaults "
+                             f"(explicitly passed CLI flags still win; default: "
+                             f"{SETTINGS_FILENAME} next to this script)")
     parser.add_argument("--web-bind", default=DEFAULT_WEB_BIND,
                         help=f"Web UI bind address (default: {DEFAULT_WEB_BIND}; the UI "
                              "has no auth, so bind to a trusted network only)")
@@ -1356,23 +1377,54 @@ def main():
     sensor_ids = [s.strip().lower() for s in args.sensors.split(",") if s.strip()]
     settings_path = args.settings_file or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), SETTINGS_FILENAME)
-    cli_params = {
-        "base_speed": args.base_speed,
-        "max_speed": args.max_speed,
-        "target_temp": args.target_temp,
-        "hard_cap_temp": args.hard_cap_temp,
-        "fall_rate": args.fall_rate,
-        "temp_hysteresis": args.temp_hysteresis,
-        "poll_interval": args.poll_interval,
-        "max_failed_polls": args.max_failed_polls,
+
+    script_defaults = {
+        "base_speed": DEFAULT_BASE_SPEED,
+        "max_speed": DEFAULT_MAX_SPEED,
+        "target_temp": DEFAULT_TARGET_TEMP,
+        "hard_cap_temp": DEFAULT_HARD_CAP_TEMP,
+        "fall_rate": DEFAULT_FALL_RATE,
+        "temp_hysteresis": DEFAULT_TEMP_HYSTERESIS,
+        "poll_interval": DEFAULT_POLL_INTERVAL,
+        "max_failed_polls": DEFAULT_MAX_FAILED_POLLS,
     }
+    explicit = {n: getattr(args, n) for n in PARAM_SPEC if hasattr(args, n)}
     try:
-        cli_params = validate_params(cli_params)
+        baseline = validate_params({**script_defaults, **explicit})
     except ValueError as e:
         parser.error(str(e))
-    params = load_settings_file(settings_path, cli_params)
+
+    # Precedence, lowest to highest: script defaults -> settings file ->
+    # explicitly passed CLI flags (an explicit flag is an explicit request).
+    file_overrides = read_settings_overrides(settings_path)
+    try:
+        params = validate_params({**script_defaults, **file_overrides, **explicit})
+    except ValueError as e:
+        log(f"Settings file {settings_path} conflicts with current flags/defaults "
+            f"({e}); ignoring the file.", level="WARNING")
+        file_overrides = {}
+        params = baseline
+    for n in sorted(set(explicit) & set(file_overrides)):
+        try:
+            file_value = PARAM_SPEC[n][0](file_overrides[n])
+        except (TypeError, ValueError):
+            continue
+        if file_value != params[n]:
+            log(f"CLI flag overrides settings file: {n} flag={params[n]} file={file_value}")
+    applied = [f"{n}={params[n]}"
+               for n in sorted(set(file_overrides) - set(explicit))
+               if params[n] != baseline[n]]
+    if applied:
+        log(f"Loaded settings overrides from {settings_path}: {', '.join(applied)} "
+            f"(web-UI 'Restore script settings' or deleting the file reverts).")
+
     aliases = {k.lower(): v for k, v in SENSOR_ALIASES.items()}
-    state = SharedState(params, baseline=cli_params, settings_path=settings_path,
+    if args.sensor_aliases:
+        try:
+            aliases.update(parse_sensor_aliases(args.sensor_aliases))
+        except ValueError as e:
+            parser.error(str(e))
+    state = SharedState(params, baseline=baseline, settings_path=settings_path,
                         aliases=aliases, demo=args.demo)
     controller = CurveController(state)
 
