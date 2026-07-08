@@ -56,9 +56,12 @@ WEB INTERFACE:
   A built-in dashboard (stdlib http.server, zero dependencies, works
   offline) serves live charts of temperatures, control temperature,
   target/hard-cap thresholds, and fan speed, plus a form to tweak every
-  control parameter at runtime. Parameter changes apply on the next poll
-  but are NOT persisted -- a restart returns to CLI flags / defaults.
-  There is no authentication: bind it to a trusted network only
+  control parameter at runtime. Parameter changes apply on the next
+  poll and are saved to a settings file (default: quidrac-settings.json
+  next to this script; override with --settings-file) that takes
+  precedence over CLI flags/defaults at startup. "Restore script
+  settings" in the UI returns to the CLI/default values and removes the
+  file. There is no authentication: bind it to a trusted network only
   (--web-bind, default 0.0.0.0; --web-port, default 8080; --no-web to
   disable).
 
@@ -120,6 +123,7 @@ DEFAULT_EXIT_SPEED = DEFAULT_BASE_SPEED  # If REVERT_ON_EXIT is False, hold this
 DEFAULT_WEB_BIND = "0.0.0.0"       # Web UI bind address ("127.0.0.1" for local-only)
 DEFAULT_WEB_PORT = 8080            # Web UI port
 HISTORY_MAX_SAMPLES = 20000        # Rolling history kept for the charts (~55h at 10s polls)
+SETTINGS_FILENAME = "quidrac-settings.json"  # Web UI overrides, saved next to this script
 # ---------------------------------------------------------------------------
 
 
@@ -145,6 +149,30 @@ PARAM_SPEC = {
 }
 
 
+def load_settings_file(path, cli_params):
+    """Merge saved web-UI overrides from `path` over the CLI/default
+    params. Returns the effective params; falls back to cli_params (with
+    a warning) if the file is missing keys' worth of sanity or unreadable."""
+    if not os.path.exists(path):
+        return cli_params
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+        overrides = {k: v for k, v in data.items() if k in PARAM_SPEC}
+        merged = validate_params({**cli_params, **overrides})
+        changed = [f"{n}={merged[n]}" for n in PARAM_SPEC if merged[n] != cli_params[n]]
+        if changed:
+            log(f"Loaded settings overrides from {path}: {', '.join(changed)} "
+                f"(web-UI 'Restore script settings' or deleting the file reverts).")
+        return merged
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        log(f"Ignoring settings file {path}: {e}. Using CLI flags/defaults.",
+            level="WARNING")
+        return cli_params
+
+
 def validate_params(params):
     """Range- and cross-check a full params dict. Returns a cleaned copy
     with values coerced to their declared types; raises ValueError."""
@@ -168,11 +196,17 @@ def validate_params(params):
 
 class SharedState:
     """Thread-safe bridge between the control loop and the web UI:
-    live-tunable parameters, rolling sample history, and status."""
+    live-tunable parameters, rolling sample history, and status.
 
-    def __init__(self, params, demo=False):
+    `baseline` holds the CLI-flag/default values; `settings_path` is the
+    override file web-UI changes are persisted to. Reverting restores
+    the baseline and removes the file."""
+
+    def __init__(self, params, baseline, settings_path, demo=False):
         self._lock = threading.Lock()
         self._params = validate_params(params)
+        self._baseline = validate_params(baseline)
+        self.settings_path = settings_path
         self._history = deque(maxlen=HISTORY_MAX_SAMPLES)
         self._status = {
             "state": "starting",
@@ -185,9 +219,27 @@ class SharedState:
         with self._lock:
             return dict(self._params)
 
+    def _save_settings_locked(self):
+        """Atomically write the current params to the settings file.
+        Returns an error string, or None on success. Lock must be held."""
+        payload = {"_note": "Written by the quidrac web UI. Overrides CLI "
+                            "flags/defaults at startup; delete (or use "
+                            "'Restore script settings') to revert."}
+        payload.update(self._params)
+        tmp = self.settings_path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(payload, f, indent=2)
+                f.write("\n")
+            os.replace(tmp, self.settings_path)
+            return None
+        except OSError as e:
+            return str(e)
+
     def update_params(self, updates):
-        """Merge, validate, and apply parameter updates. Returns
-        (new_params, list of 'name: old -> new' change strings)."""
+        """Merge, validate, apply, and persist parameter updates. Returns
+        (new_params, list of 'name: old -> new' change strings,
+        save error string or None)."""
         with self._lock:
             merged = dict(self._params)
             for name in updates:
@@ -198,7 +250,24 @@ class SharedState:
             changes = [f"{n}: {self._params[n]} -> {clean[n]}"
                        for n in PARAM_SPEC if clean[n] != self._params[n]]
             self._params = clean
-            return dict(clean), changes
+            save_error = self._save_settings_locked() if changes else None
+            return dict(clean), changes, save_error
+
+    def revert_to_baseline(self):
+        """Restore the CLI-flag/default params and remove the settings
+        file. Returns (params, list of change strings, error or None)."""
+        with self._lock:
+            changes = [f"{n}: {self._params[n]} -> {self._baseline[n]}"
+                       for n in PARAM_SPEC if self._baseline[n] != self._params[n]]
+            self._params = dict(self._baseline)
+            error = None
+            try:
+                os.remove(self.settings_path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                error = str(e)
+            return dict(self._params), changes, error
 
     def add_sample(self, sample):
         with self._lock:
@@ -216,6 +285,8 @@ class SharedState:
                 "params": dict(self._params),
                 "status": dict(self._status),
                 "samples": samples,
+                "settings_file": os.path.basename(self.settings_path),
+                "overrides_active": self._params != self._baseline,
             }
 
 
@@ -528,24 +599,41 @@ def start_web_server(state, bind, port):
 
         def do_POST(self):
             url = urlparse(self.path)
-            if url.path != "/api/params":
+            if url.path == "/api/params":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    updates = json.loads(self.rfile.read(length) or b"{}")
+                    if not isinstance(updates, dict):
+                        raise ValueError("expected a JSON object")
+                    new_params, changes, save_error = state.update_params(updates)
+                except ValueError as e:
+                    self._send_json(400, {"error": str(e)})
+                    return
+                except json.JSONDecodeError:
+                    self._send_json(400, {"error": "invalid JSON"})
+                    return
+                if changes:
+                    log("Params updated via web UI: " + "; ".join(changes)
+                        + (f" (saved to {state.settings_path})" if not save_error else ""))
+                if save_error:
+                    log(f"Could not save settings to {state.settings_path}: {save_error}",
+                        level="ERROR")
+                self._send_json(200, {"ok": True, "params": new_params,
+                                      "save_error": save_error})
+            elif url.path == "/api/revert":
+                new_params, changes, error = state.revert_to_baseline()
+                if changes:
+                    log("Reverted to script settings via web UI: " + "; ".join(changes))
+                if error:
+                    log(f"Could not remove settings file {state.settings_path}: {error}",
+                        level="ERROR")
+                else:
+                    log(f"Settings file {state.settings_path} removed; "
+                        f"script settings (CLI flags/defaults) in effect.")
+                self._send_json(200, {"ok": True, "params": new_params,
+                                      "save_error": error})
+            else:
                 self._send_json(404, {"error": "not found"})
-                return
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                updates = json.loads(self.rfile.read(length) or b"{}")
-                if not isinstance(updates, dict):
-                    raise ValueError("expected a JSON object")
-                new_params, changes = state.update_params(updates)
-            except ValueError as e:
-                self._send_json(400, {"error": str(e)})
-                return
-            except json.JSONDecodeError:
-                self._send_json(400, {"error": "invalid JSON"})
-                return
-            if changes:
-                log("Params updated via web UI: " + "; ".join(changes))
-            self._send_json(200, {"ok": True, "params": new_params})
 
     server = ThreadingHTTPServer((bind, port), Handler)
     server.daemon_threads = True
@@ -719,11 +807,11 @@ th:first-child, td:first-child { text-align: left; }
 
 <section class="card">
   <h2>Parameters</h2>
-  <div class="desc">Applied on the next poll. Not persisted &mdash; a restart returns to CLI flags/defaults.</div>
+  <div class="desc" id="pdesc">Applied on the next poll.</div>
   <div class="params-grid" id="pgrid"></div>
   <div class="formrow">
     <button id="applyBtn">Apply</button>
-    <button id="revertBtn">Revert edits</button>
+    <button id="revertBtn">Restore script settings</button>
     <span class="formmsg" id="formmsg"></span>
   </div>
 </section>
@@ -755,6 +843,7 @@ async function poll() {
     if (!r.ok) throw new Error("HTTP " + r.status);
     const j = await r.json();
     S.params = j.params; S.spec = j.param_spec; S.status = j.status; S.now = j.now;
+    S.settingsFile = j.settings_file; S.overridesActive = j.overrides_active;
     if (j.samples.length) {
       S.samples.push(...j.samples);
       S.lastT = j.samples[j.samples.length - 1].t;
@@ -799,6 +888,11 @@ function render() {
     const head = last.cap - last.max;
     $("tHead").textContent = head + "°C";
     $("tHeadNote").textContent = "hard cap at " + last.cap + "°C";
+  }
+  if (S.settingsFile) {
+    $("pdesc").textContent = "Applied on the next poll and saved to " + S.settingsFile +
+      (S.overridesActive ? " (overriding script settings). " : ". ") +
+      "“Restore script settings” returns to CLI flags/defaults and removes the file.";
   }
   drawTemps(); drawSpeed();
   if (S.tableOn) renderTable();
@@ -1111,11 +1205,36 @@ async function applyParams() {
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
     S.params = j.params; S.formDirty = false;
-    msg.className = "formmsg ok"; msg.textContent = "Applied.";
+    if (j.save_error) {
+      msg.className = "formmsg err";
+      msg.textContent = "Applied, but could not save: " + j.save_error;
+    } else {
+      msg.className = "formmsg ok"; msg.textContent = "Applied & saved.";
+    }
   } catch (e) {
     msg.className = "formmsg err"; msg.textContent = String(e.message || e);
   }
-  setTimeout(() => { if (msg.textContent === "Applied.") msg.textContent = ""; }, 4000);
+  setTimeout(() => { if (msg.className === "formmsg ok") msg.textContent = ""; }, 4000);
+}
+
+async function revertParams() {
+  const msg = $("formmsg");
+  try {
+    const r = await fetch("/api/revert", { method: "POST" });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+    S.params = j.params;
+    fillForm();
+    if (j.save_error) {
+      msg.className = "formmsg err";
+      msg.textContent = "Reverted, but could not remove settings file: " + j.save_error;
+    } else {
+      msg.className = "formmsg ok"; msg.textContent = "Script settings restored.";
+    }
+  } catch (e) {
+    msg.className = "formmsg err"; msg.textContent = String(e.message || e);
+  }
+  setTimeout(() => { if (msg.className === "formmsg ok") msg.textContent = ""; }, 4000);
 }
 
 /* ---------- wiring ---------- */
@@ -1134,7 +1253,7 @@ $("tableBtn").addEventListener("click", () => {
   if (S.tableOn) renderTable();
 });
 $("applyBtn").addEventListener("click", applyParams);
-$("revertBtn").addEventListener("click", () => { fillForm(); $("formmsg").textContent = ""; });
+$("revertBtn").addEventListener("click", revertParams);
 attachHover($("chartT"), $("tipT"), tempSeries, "°C");
 attachHover($("chartS"), $("tipS"), speedSeries, "%");
 window.addEventListener("resize", render);
@@ -1197,6 +1316,10 @@ def main():
                         help="Fan speed %% to hold on exit when --no-revert-on-exit is set "
                              f"(default: {DEFAULT_EXIT_SPEED})")
 
+    parser.add_argument("--settings-file", default=None,
+                        help=f"Path where web-UI parameter changes are saved and, if "
+                             f"present at startup, override CLI flags/defaults "
+                             f"(default: {SETTINGS_FILENAME} next to this script)")
     parser.add_argument("--web-bind", default=DEFAULT_WEB_BIND,
                         help=f"Web UI bind address (default: {DEFAULT_WEB_BIND}; the UI "
                              "has no auth, so bind to a trusted network only)")
@@ -1219,19 +1342,25 @@ def main():
         ipmi = IdracIpmi(args.host, args.user, password)
 
     sensor_ids = [s.strip().lower() for s in args.sensors.split(",") if s.strip()]
+    settings_path = args.settings_file or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), SETTINGS_FILENAME)
+    cli_params = {
+        "base_speed": args.base_speed,
+        "max_speed": args.max_speed,
+        "target_temp": args.target_temp,
+        "hard_cap_temp": args.hard_cap_temp,
+        "fall_rate": args.fall_rate,
+        "temp_hysteresis": args.temp_hysteresis,
+        "poll_interval": args.poll_interval,
+        "max_failed_polls": args.max_failed_polls,
+    }
     try:
-        state = SharedState({
-            "base_speed": args.base_speed,
-            "max_speed": args.max_speed,
-            "target_temp": args.target_temp,
-            "hard_cap_temp": args.hard_cap_temp,
-            "fall_rate": args.fall_rate,
-            "temp_hysteresis": args.temp_hysteresis,
-            "poll_interval": args.poll_interval,
-            "max_failed_polls": args.max_failed_polls,
-        }, demo=args.demo)
+        cli_params = validate_params(cli_params)
     except ValueError as e:
         parser.error(str(e))
+    params = load_settings_file(settings_path, cli_params)
+    state = SharedState(params, baseline=cli_params,
+                        settings_path=settings_path, demo=args.demo)
     controller = CurveController(state)
 
     def handle_shutdown(signum, frame):
