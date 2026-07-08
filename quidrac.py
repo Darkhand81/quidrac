@@ -30,6 +30,13 @@ STRATEGY (temperature -> speed curve with asymmetric slew):
     percent per poll, and never below the curve. The speed therefore
     settles at the lowest value that holds temperature at the curve --
     keeping fans as quiet as possible without overheating.
+  - Hysteresis: the curve is driven by a "control temperature" that
+    follows raw readings upward instantly but only follows them down
+    after they drop by --temp-hysteresis degrees. IPMI sensors report
+    whole degrees, so a reading flickering between e.g. 67C and 68C
+    would otherwise bounce the fans every few polls; with hysteresis the
+    speed settles at the top of the flicker band and stays there until
+    the temperature genuinely falls.
 
 SAFETY / FAILURE HANDLING:
   - Dead-man's switch: after --max-failed-polls consecutive failed polls
@@ -81,6 +88,7 @@ DEFAULT_TARGET_TEMP = 65           # Curve start: temps at/below this run at bas
 DEFAULT_HARD_CAP_TEMP = 80         # Curve end: temps at/above this run at max speed (C)
 DEFAULT_MAX_SPEED = 100            # Maximum fan speed (%)
 DEFAULT_FALL_RATE = 2.0            # Max fan speed decrease per poll when cooling (%/poll)
+DEFAULT_TEMP_HYSTERESIS = 2.0      # Temp must fall this far below its recent peak before fans follow (C)
 
 DEFAULT_MAX_FAILED_POLLS = 5       # Consecutive failed polls before failsafe revert to auto
 DEFAULT_REVERT_ON_EXIT = True      # Revert to automatic iDRAC fan control on exit
@@ -152,12 +160,15 @@ class IdracIpmi:
 
 class CurveController:
     """
-    Stateless temperature->speed curve plus asymmetric slew limiting:
-    speed rises instantly to the curve, but falls at most fall_rate
-    percent per poll. The only state is the current speed itself.
+    Temperature->speed curve plus asymmetric slew limiting: speed rises
+    instantly to the curve, but falls at most fall_rate percent per
+    poll. The curve is driven by a hysteresis-filtered control
+    temperature (rises instantly, falls only after a temp_hysteresis
+    drop) so single-degree sensor flicker doesn't bounce the fans.
     """
 
-    def __init__(self, base_speed, target_temp, hard_cap_temp, max_speed, fall_rate):
+    def __init__(self, base_speed, target_temp, hard_cap_temp, max_speed,
+                 fall_rate, temp_hysteresis):
         if hard_cap_temp <= target_temp:
             raise ValueError("hard-cap-temp must be greater than target-temp")
         self.base_speed = base_speed
@@ -165,8 +176,10 @@ class CurveController:
         self.hard_cap_temp = hard_cap_temp
         self.max_speed = max_speed
         self.fall_rate = fall_rate
+        self.temp_hysteresis = temp_hysteresis
 
         self.current_speed = float(base_speed)
+        self.control_temp = None
 
     def curve(self, temp):
         """Desired fan speed (%) for a given temperature."""
@@ -182,7 +195,14 @@ class CurveController:
         Given the hottest current sensor reading, return the fan speed to
         apply (integer percent). Rise instantly, fall slowly.
         """
-        desired = self.curve(max_temp)
+        # Hysteresis: follow the raw temp up immediately, but only follow
+        # it down once it has genuinely fallen, not on 1C sensor flicker.
+        if self.control_temp is None or max_temp >= self.control_temp:
+            self.control_temp = max_temp
+        elif max_temp <= self.control_temp - self.temp_hysteresis:
+            self.control_temp = max_temp
+
+        desired = self.curve(self.control_temp)
         if desired > self.current_speed:
             self.current_speed = desired
         else:
@@ -225,10 +245,12 @@ def run_loop(ipmi, controller, sensor_ids, poll_interval, max_failed_polls):
 
             if speed != last_speed:
                 log(f"Fan speed {'set' if last_speed is None else 'changed'} to {speed}% "
-                    f"(curve target {controller.curve(max_temp):.1f}% at {max_temp}C).")
+                    f"(curve target {controller.curve(controller.control_temp):.1f}% "
+                    f"at control temp {controller.control_temp}C).")
                 last_speed = speed
 
-            log(f"Readings: {readings} | max={max_temp}C | speed={speed}%")
+            log(f"Readings: {readings} | max={max_temp}C | "
+                f"control={controller.control_temp}C | speed={speed}%")
 
         except Exception as e:
             consecutive_failures += 1
@@ -302,6 +324,10 @@ def main():
     parser.add_argument("--fall-rate", type=float, default=DEFAULT_FALL_RATE,
                         help="Max fan speed decrease per poll when cooling (%%/poll). "
                              "Rises are always instant.")
+    parser.add_argument("--temp-hysteresis", type=float, default=DEFAULT_TEMP_HYSTERESIS,
+                        help="Temp must fall this many degrees below its recent peak "
+                             "before fans follow it down (C). Prevents fan bounce from "
+                             "1C sensor flicker; 0 disables.")
 
     parser.add_argument("--max-failed-polls", type=int, default=DEFAULT_MAX_FAILED_POLLS,
                         help="Consecutive failed polls before the failsafe reverts "
@@ -330,6 +356,7 @@ def main():
         hard_cap_temp=args.hard_cap_temp,
         max_speed=args.max_speed,
         fall_rate=args.fall_rate,
+        temp_hysteresis=args.temp_hysteresis,
     )
 
     def handle_shutdown(signum, frame):
@@ -341,7 +368,8 @@ def main():
 
     log(f"Starting. Monitoring sensors {sensor_ids}. Curve: {args.base_speed}% at "
         f"<={args.target_temp}C -> {args.max_speed}% at >={args.hard_cap_temp}C, "
-        f"fall rate {args.fall_rate}%/poll, poll every {args.poll_interval}s, "
+        f"fall rate {args.fall_rate}%/poll, hysteresis {args.temp_hysteresis}C, "
+        f"poll every {args.poll_interval}s, "
         f"failsafe after {args.max_failed_polls} failed polls.")
 
     engaged = False
