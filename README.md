@@ -138,6 +138,8 @@ handing control *back*:
 
 ## Web dashboard
 
+<img width="40%" src="https://github.com/user-attachments/assets/55a3ede7-32db-4527-a5d6-531d9bd4a532" />
+
 Zero-dependency (stdlib HTTP server, fully inline page — works on an offline
 management LAN), served on `--web-port` 8080 by default:
 
@@ -152,6 +154,7 @@ management LAN), served on `--web-port` 8080 by default:
 
 There is **no authentication**. Bind it to a trusted network only
 (`--web-bind 127.0.0.1` for local-only), or disable it with `--no-web`.
+
 
 ## Settings precedence
 
