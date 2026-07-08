@@ -1,45 +1,68 @@
 #!/usr/bin/env python3
 """
-idrac_fan_watchdog.py
+quidrac.py
 
-Custom software-based thermal ramp control for Dell iDRAC, using raw IPMI
+Custom software-based thermal control loop for Dell iDRAC, using raw IPMI
 fan override (since racadm/native thermal-profile tuning isn't available
 in this environment).
 
 Because we're fully overriding iDRAC's automatic algorithm, this script
-IS the thermal control loop -- it must run continuously. If it dies,
-fans stay wherever they were last set. Run it under a process supervisor
-(systemd, supervisord, etc.) so it restarts automatically, and see the
---revert-on-exit behavior below.
+IS the thermal control loop -- it must run continuously. Run it under a
+process supervisor (systemd, supervisord, etc.) so it restarts
+automatically. For belt-and-braces safety under systemd, also add an
+external backstop that reverts to automatic control if the unit stops
+for any reason:
 
-STRATEGY (a staircase ramp):
-  - Start at --base-speed (default 30%).
-  - Each fan-speed "step" has its own temperature ceiling. The ceiling
-    rises slightly with each step, since higher fan speed generally
-    buys you more thermal headroom before further action is needed:
+    ExecStopPost=/usr/bin/ipmitool -I lanplus -H <host> -U <user> -E \\
+        raw 0x30 0x30 0x01 0x01
 
-        speed:      30%    35%    40%    45%   ...
-        ceiling:    70C    72C    74C    76C   ...   (--base-max-temp,
-                                                       --step-temp-increment)
+STRATEGY (temperature -> speed curve with asymmetric slew):
+  - Fan speed is a pure function of the hottest monitored sensor:
 
-  - If the hottest monitored sensor exceeds the ceiling for the CURRENT
-    speed, bump fan speed up by --step-percent.
-  - If temps reach --hard-cap-temp, keep stepping up by --step-percent
-    every poll (not jumping straight to --max-speed) until the max
-    reading is held at or below the cap, capping out at --max-speed if
-    it's still not enough.
-  - If temps drop comfortably below --target-temp for several
-    consecutive polls (--ramp-down-debounce), step speed back down,
-    never below --base-speed.
+        temp <= --target-temp     ->  --base-speed
+        temp >= --hard-cap-temp   ->  --max-speed
+        in between                ->  linear interpolation
 
-All numbers are configurable via CLI flags. Defaults match what was
-discussed: 30% base speed, 65C target, 70C ceiling at base speed, 5%
-ramp steps, 80C hard cap, 10s poll interval.
+  - Rising temps take effect instantly: if the curve says a higher speed,
+    it is applied on that same poll (so hitting the hard cap jumps
+    straight to max speed -- no gradual ramp during an emergency).
+  - Falling temps decay slowly: speed drops by at most --fall-rate
+    percent per poll, and never below the curve. The speed therefore
+    settles at the lowest value that holds temperature at the curve --
+    keeping fans as quiet as possible without overheating.
+  - Hysteresis: the curve is driven by a "control temperature" that
+    follows raw readings upward instantly but only follows them down
+    after they drop by --temp-hysteresis degrees. IPMI sensors report
+    whole degrees, so a reading flickering between e.g. 67C and 68C
+    would otherwise bounce the fans every few polls; with hysteresis the
+    speed settles at the top of the flicker band and stays there until
+    the temperature genuinely falls.
+
+SAFETY / FAILURE HANDLING:
+  - Dead-man's switch: after --max-failed-polls consecutive failed polls
+    (IPMI errors, timeouts, or no sensor readings) the script assumes it
+    is flying blind and reverts iDRAC to automatic fan control, retrying
+    that revert on every subsequent failed poll until it succeeds. When
+    polling recovers, manual control is re-engaged automatically.
+  - Manual mode and fan speed are re-asserted on EVERY poll (both raw
+    commands are cheap and idempotent), so an iDRAC reset -- firmware
+    update, racreset, watchdog -- can't silently drop the override while
+    we keep believing it's active.
+  - Cleanup (revert to auto, or hold --exit-speed) runs in a finally
+    block, so it happens on SIGINT/SIGTERM *and* on crashes, not just
+    clean signals.
+
+CREDENTIALS:
+  Prefer setting the IPMI_PASSWORD environment variable over passing
+  --password on the command line (argv is visible to every local user
+  via ps). Either way, the password is handed to ipmitool through its
+  environment (-E), never on the ipmitool command line.
 
 Requires: ipmitool, IPMI-over-LAN enabled in iDRAC.
 """
 
 import argparse
+import os
 import re
 import signal
 import subprocess
@@ -55,22 +78,21 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 DEFAULT_HOST = None                # e.g. "192.168.1.100" (still required via --host if left None)
 DEFAULT_USER = None                # e.g. "root"
-DEFAULT_PASSWORD = None            # e.g. "calvin"
+DEFAULT_PASSWORD = None            # prefer the IPMI_PASSWORD env var over hardcoding here
 
 DEFAULT_SENSORS = "0Eh,0Fh"        # Sensor IDs to monitor (see `ipmitool sdr list`)
 DEFAULT_POLL_INTERVAL = 10         # Seconds between polls
 
-DEFAULT_BASE_SPEED = 30            # Starting / minimum fan speed (%)
-DEFAULT_TARGET_TEMP = 65           # Temp to settle around (C)
-DEFAULT_BASE_MAX_TEMP = 70         # Ceiling temp at base speed before ramping up (C)
-DEFAULT_STEP_PERCENT = 5           # Fan speed step size (%)
-DEFAULT_STEP_TEMP_INCREMENT = 2    # How much the ceiling rises per step (C)
-DEFAULT_HARD_CAP_TEMP = 80         # Absolute max temp; jumps to max speed immediately (C)
+DEFAULT_BASE_SPEED = 30            # Minimum fan speed (%), used at/below target temp
+DEFAULT_TARGET_TEMP = 65           # Curve start: temps at/below this run at base speed (C)
+DEFAULT_HARD_CAP_TEMP = 80         # Curve end: temps at/above this run at max speed (C)
 DEFAULT_MAX_SPEED = 100            # Maximum fan speed (%)
-DEFAULT_RAMP_DOWN_DEBOUNCE = 3     # Consecutive below-target polls before ramping down
+DEFAULT_FALL_RATE = 2.0            # Max fan speed decrease per poll when cooling (%/poll)
+DEFAULT_TEMP_HYSTERESIS = 2.0      # Temp must fall this far below its recent peak before fans follow (C)
 
-DEFAULT_REVERT_ON_EXIT = True      # Revert to automatic iDRAC fan control on clean exit
-DEFAULT_EXIT_SPEED = DEFAULT_BASE_SPEED  # If REVERT_ON_EXIT is False, set fans to this speed (%) on clean exit instead
+DEFAULT_MAX_FAILED_POLLS = 5       # Consecutive failed polls before failsafe revert to auto
+DEFAULT_REVERT_ON_EXIT = True      # Revert to automatic iDRAC fan control on exit
+DEFAULT_EXIT_SPEED = DEFAULT_BASE_SPEED  # If REVERT_ON_EXIT is False, hold this speed (%) on exit instead
 # ---------------------------------------------------------------------------
 
 
@@ -83,15 +105,21 @@ class IdracIpmi:
     def __init__(self, host, user, password, interface="lanplus"):
         self.host = host
         self.user = user
-        self.password = password
         self.interface = interface
+        # Password goes to ipmitool via its environment (-E), keeping it
+        # out of /proc/*/cmdline. Some ipmitool builds check
+        # IPMITOOL_PASSWORD for -E, others IPMI_PASSWORD; set both.
+        self._env = dict(os.environ)
+        self._env["IPMI_PASSWORD"] = password
+        self._env["IPMITOOL_PASSWORD"] = password
 
     def _run(self, args, timeout=15):
         cmd = [
             "ipmitool", "-I", self.interface,
-            "-H", self.host, "-U", self.user, "-P", self.password,
+            "-H", self.host, "-U", self.user, "-E",
         ] + args
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=timeout, env=self._env)
         if result.returncode != 0:
             raise RuntimeError(f"ipmitool failed ({' '.join(args)}): {result.stderr.strip()}")
         return result.stdout
@@ -130,176 +158,233 @@ class IdracIpmi:
         return readings
 
 
-class RampController:
-    def __init__(self, base_speed, base_max_temp, step_percent, step_temp_increment,
-                 target_temp, hard_cap_temp, max_speed, ramp_down_debounce):
+class CurveController:
+    """
+    Temperature->speed curve plus asymmetric slew limiting: speed rises
+    instantly to the curve, but falls at most fall_rate percent per
+    poll. The curve is driven by a hysteresis-filtered control
+    temperature (rises instantly, falls only after a temp_hysteresis
+    drop) so single-degree sensor flicker doesn't bounce the fans.
+    """
+
+    def __init__(self, base_speed, target_temp, hard_cap_temp, max_speed,
+                 fall_rate, temp_hysteresis):
+        if hard_cap_temp <= target_temp:
+            raise ValueError("hard-cap-temp must be greater than target-temp")
         self.base_speed = base_speed
-        self.base_max_temp = base_max_temp
-        self.step_percent = step_percent
-        self.step_temp_increment = step_temp_increment
         self.target_temp = target_temp
         self.hard_cap_temp = hard_cap_temp
         self.max_speed = max_speed
-        self.ramp_down_debounce = ramp_down_debounce
+        self.fall_rate = fall_rate
+        self.temp_hysteresis = temp_hysteresis
 
-        self.current_speed = base_speed
-        self._below_target_count = 0
+        self.current_speed = float(base_speed)
+        self.control_temp = None
 
-    def ceiling_for(self, speed):
-        """Temperature ceiling for a given fan speed (the staircase)."""
-        level = max(0, (speed - self.base_speed) // self.step_percent)
-        ceiling = self.base_max_temp + level * self.step_temp_increment
-        return min(ceiling, self.hard_cap_temp)
+    def curve(self, temp):
+        """Desired fan speed (%) for a given temperature."""
+        if temp <= self.target_temp:
+            return float(self.base_speed)
+        if temp >= self.hard_cap_temp:
+            return float(self.max_speed)
+        frac = (temp - self.target_temp) / (self.hard_cap_temp - self.target_temp)
+        return self.base_speed + frac * (self.max_speed - self.base_speed)
 
     def evaluate(self, max_temp):
         """
-        Given the hottest current sensor reading, decide whether to change
-        fan speed. Returns the new speed (may be unchanged).
+        Given the hottest current sensor reading, return the fan speed to
+        apply (integer percent). Rise instantly, fall slowly.
         """
-        ceiling = self.ceiling_for(self.current_speed)
-        at_hard_cap = max_temp >= self.hard_cap_temp
+        # Hysteresis: follow the raw temp up immediately, but only follow
+        # it down once it has genuinely fallen, not on 1C sensor flicker.
+        if self.control_temp is None or max_temp >= self.control_temp:
+            self.control_temp = max_temp
+        elif max_temp <= self.control_temp - self.temp_hysteresis:
+            self.control_temp = max_temp
 
-        # Ramp up: current ceiling exceeded (ceiling is itself capped at
-        # hard_cap_temp, so once at max ceiling this keeps stepping by
-        # step_percent for as long as temp stays at/above the hard cap,
-        # rather than jumping straight to max speed).
-        if (max_temp > ceiling or at_hard_cap) and self.current_speed < self.max_speed:
-            new_speed = min(self.current_speed + self.step_percent, self.max_speed)
-            level = "CRITICAL" if at_hard_cap else "INFO"
-            reason = f"at/above hard cap {self.hard_cap_temp}C" if at_hard_cap else f"exceeds ceiling {ceiling}C"
-            log(f"Temp {max_temp}C {reason} at {self.current_speed}%. "
-                f"Ramping up to {new_speed}%.", level=level)
-            self.current_speed = new_speed
-            self._below_target_count = 0
-            return self.current_speed
+        desired = self.curve(self.control_temp)
+        if desired > self.current_speed:
+            self.current_speed = desired
+        else:
+            self.current_speed = max(desired, self.current_speed - self.fall_rate)
+        return int(round(self.current_speed))
 
-        if at_hard_cap and self.current_speed >= self.max_speed:
-            log(f"Temp {max_temp}C at/above hard cap {self.hard_cap_temp}C, already at "
-                f"max speed {self.max_speed}%. No further headroom available.", level="CRITICAL")
-            self._below_target_count = 0
-            return self.current_speed
 
-        # Ramp down: comfortably below target for several consecutive polls.
-        if max_temp < self.target_temp and self.current_speed > self.base_speed:
-            self._below_target_count += 1
-            if self._below_target_count >= self.ramp_down_debounce:
-                new_speed = max(self.current_speed - self.step_percent, self.base_speed)
-                log(f"Temp {max_temp}C below target {self.target_temp}C for "
-                    f"{self._below_target_count} polls. Ramping down to {new_speed}%.")
-                self.current_speed = new_speed
-                self._below_target_count = 0
-            return self.current_speed
+def run_loop(ipmi, controller, sensor_ids, poll_interval, max_failed_polls):
+    consecutive_failures = 0
+    failsafe = False           # too many failures; trying to hand back to iDRAC
+    failsafe_engaged = False   # the revert-to-auto command actually succeeded
+    last_speed = None
 
-        # Steady state.
-        self._below_target_count = 0
-        return self.current_speed
+    while True:
+        try:
+            readings = ipmi.read_temps(sensor_ids)
+            if not readings:
+                raise RuntimeError(
+                    f"no readings for sensors {sensor_ids} -- check IDs with "
+                    f"'ipmitool sdr type Temperature'")
+
+            if failsafe:
+                log("Polling recovered. Re-engaging manual fan control.", level="WARNING")
+            consecutive_failures = 0
+            failsafe = False
+            failsafe_engaged = False
+
+            max_temp = max(readings.values())
+            speed = controller.evaluate(max_temp)
+
+            if max_temp >= controller.hard_cap_temp:
+                log(f"Temp {max_temp}C at/above hard cap {controller.hard_cap_temp}C. "
+                    f"Fans at {speed}%.", level="CRITICAL")
+
+            # Re-assert manual mode and speed every poll: both commands are
+            # cheap and idempotent, and this self-heals after an iDRAC
+            # reset silently drops the override.
+            ipmi.set_manual_mode()
+            ipmi.set_fan_speed(speed)
+
+            if speed != last_speed:
+                log(f"Fan speed {'set' if last_speed is None else 'changed'} to {speed}% "
+                    f"(curve target {controller.curve(controller.control_temp):.1f}% "
+                    f"at control temp {controller.control_temp}C).")
+                last_speed = speed
+
+            log(f"Readings: {readings} | max={max_temp}C | "
+                f"control={controller.control_temp}C | speed={speed}%")
+
+        except Exception as e:
+            consecutive_failures += 1
+            log(f"Poll failed ({consecutive_failures}/{max_failed_polls}): {e}",
+                level="WARNING")
+
+            if consecutive_failures >= max_failed_polls and not failsafe:
+                log(f"{consecutive_failures} consecutive failed polls -- flying blind. "
+                    f"Failsafe: reverting to automatic iDRAC fan control.", level="CRITICAL")
+                failsafe = True
+                last_speed = None  # force re-log once we recover
+
+            if failsafe and not failsafe_engaged:
+                try:
+                    ipmi.set_auto_mode()
+                    failsafe_engaged = True
+                    log("Failsafe engaged: iDRAC automatic fan control restored. "
+                        "Will re-engage manual control when polling recovers.",
+                        level="CRITICAL")
+                except Exception as e2:
+                    log(f"Failsafe revert failed ({e2}); retrying next poll.",
+                        level="CRITICAL")
+
+        time.sleep(poll_interval)
+
+
+def cleanup(ipmi, revert_on_exit, exit_speed, attempts=3):
+    """Hand control back to iDRAC (or pin the exit speed). Retries because
+    this is the last line of defense before the process goes away."""
+    for attempt in range(1, attempts + 1):
+        try:
+            if revert_on_exit:
+                ipmi.set_auto_mode()
+                log("Reverted to automatic iDRAC fan control.")
+            else:
+                ipmi.set_manual_mode()
+                ipmi.set_fan_speed(exit_speed)
+                log(f"Manual mode retained. Fan speed set to {exit_speed}% on exit.")
+            return
+        except Exception as e:
+            log(f"Cleanup attempt {attempt}/{attempts} failed: {e}", level="ERROR")
+            if attempt < attempts:
+                time.sleep(2)
+    log("Cleanup failed; iDRAC may still be in manual mode at the last set speed!",
+        level="CRITICAL")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Custom software fan ramp watchdog for iDRAC.")
+    parser = argparse.ArgumentParser(
+        description="Custom software fan control loop for iDRAC "
+                    "(temperature->speed curve with asymmetric slew).")
     parser.add_argument("--host", default=DEFAULT_HOST, required=DEFAULT_HOST is None)
     parser.add_argument("--user", default=DEFAULT_USER, required=DEFAULT_USER is None)
-    parser.add_argument("--password", default=DEFAULT_PASSWORD, required=DEFAULT_PASSWORD is None)
+    parser.add_argument("--password", default=DEFAULT_PASSWORD,
+                        help="iDRAC password. Prefer the IPMI_PASSWORD environment "
+                             "variable, which keeps it out of process listings.")
 
     parser.add_argument("--sensors", default=DEFAULT_SENSORS,
-                         help=f"Comma-separated sensor IDs to monitor (default: {DEFAULT_SENSORS})")
+                        help=f"Comma-separated sensor IDs to monitor (default: {DEFAULT_SENSORS})")
     parser.add_argument("--poll-interval", type=int, default=DEFAULT_POLL_INTERVAL,
-                         help="Seconds between polls")
+                        help="Seconds between polls")
 
     parser.add_argument("--base-speed", type=int, default=DEFAULT_BASE_SPEED,
-                         help="Starting/minimum fan speed %%")
+                        help="Minimum fan speed %%, used at/below --target-temp")
     parser.add_argument("--target-temp", type=float, default=DEFAULT_TARGET_TEMP,
-                         help="Temp to settle around (C)")
-    parser.add_argument("--base-max-temp", type=float, default=DEFAULT_BASE_MAX_TEMP,
-                         help="Ceiling temp at base speed before ramping up (C)")
-    parser.add_argument("--step-percent", type=int, default=DEFAULT_STEP_PERCENT,
-                         help="Fan speed step size %%")
-    parser.add_argument("--step-temp-increment", type=float, default=DEFAULT_STEP_TEMP_INCREMENT,
-                         help="How much the ceiling rises per step (C)")
+                        help="Curve start (C): at/below this temp fans run at --base-speed")
     parser.add_argument("--hard-cap-temp", type=float, default=DEFAULT_HARD_CAP_TEMP,
-                         help="Absolute max temp; jumps to --max-speed immediately if hit (C)")
+                        help="Curve end (C): at/above this temp fans jump to --max-speed")
     parser.add_argument("--max-speed", type=int, default=DEFAULT_MAX_SPEED,
-                         help="Maximum fan speed %%")
-    parser.add_argument("--ramp-down-debounce", type=int, default=DEFAULT_RAMP_DOWN_DEBOUNCE,
-                         help="Consecutive below-target polls required before ramping down")
+                        help="Maximum fan speed %%")
+    parser.add_argument("--fall-rate", type=float, default=DEFAULT_FALL_RATE,
+                        help="Max fan speed decrease per poll when cooling (%%/poll). "
+                             "Rises are always instant.")
+    parser.add_argument("--temp-hysteresis", type=float, default=DEFAULT_TEMP_HYSTERESIS,
+                        help="Temp must fall this many degrees below its recent peak "
+                             "before fans follow it down (C). Prevents fan bounce from "
+                             "1C sensor flicker; 0 disables.")
 
+    parser.add_argument("--max-failed-polls", type=int, default=DEFAULT_MAX_FAILED_POLLS,
+                        help="Consecutive failed polls before the failsafe reverts "
+                             "iDRAC to automatic fan control")
     parser.add_argument("--revert-on-exit", dest="revert_on_exit", action="store_true",
-                         default=DEFAULT_REVERT_ON_EXIT,
-                         help="Revert to automatic iDRAC fan control on clean exit (default: on)")
+                        default=DEFAULT_REVERT_ON_EXIT,
+                        help="Revert to automatic iDRAC fan control on exit (default: on)")
     parser.add_argument("--no-revert-on-exit", dest="revert_on_exit", action="store_false",
-                         help="Do NOT revert to automatic control on exit; hold --exit-speed instead")
+                        help="Do NOT revert to automatic control on exit; hold --exit-speed instead")
     parser.add_argument("--exit-speed", type=int, default=DEFAULT_EXIT_SPEED,
-                         help="Fan speed %% to hold on clean exit when --no-revert-on-exit is set "
-                              f"(default: {DEFAULT_EXIT_SPEED})")
+                        help="Fan speed %% to hold on exit when --no-revert-on-exit is set "
+                             f"(default: {DEFAULT_EXIT_SPEED})")
 
     args = parser.parse_args()
 
+    password = args.password or os.environ.get("IPMI_PASSWORD")
+    if not password:
+        parser.error("no password: pass --password or set the IPMI_PASSWORD "
+                     "environment variable (preferred)")
+
     sensor_ids = [s.strip() for s in args.sensors.split(",") if s.strip()]
-    ipmi = IdracIpmi(args.host, args.user, args.password)
-    controller = RampController(
+    ipmi = IdracIpmi(args.host, args.user, password)
+    controller = CurveController(
         base_speed=args.base_speed,
-        base_max_temp=args.base_max_temp,
-        step_percent=args.step_percent,
-        step_temp_increment=args.step_temp_increment,
         target_temp=args.target_temp,
         hard_cap_temp=args.hard_cap_temp,
         max_speed=args.max_speed,
-        ramp_down_debounce=args.ramp_down_debounce,
+        fall_rate=args.fall_rate,
+        temp_hysteresis=args.temp_hysteresis,
     )
 
     def handle_shutdown(signum, frame):
         log(f"Received signal {signum}, shutting down.")
-        if args.revert_on_exit:
-            try:
-                ipmi.set_auto_mode()
-                log("Reverted to automatic iDRAC fan control.")
-            except Exception as e:
-                log(f"Failed to revert to automatic control: {e}", level="ERROR")
-        else:
-            try:
-                ipmi.set_fan_speed(args.exit_speed)
-                log(f"Manual mode retained. Fan speed set to {args.exit_speed}% on exit.")
-            except Exception as e:
-                log(f"Failed to set exit fan speed: {e}", level="ERROR")
-        sys.exit(0)
+        sys.exit(0)  # unwinds through the finally block below
 
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
 
-    log(f"Starting watchdog. Monitoring sensors {sensor_ids}, base_speed={args.base_speed}%, "
-        f"target={args.target_temp}C, base_max_temp={args.base_max_temp}C, "
-        f"step={args.step_percent}% / {args.step_temp_increment}C, "
-        f"hard_cap={args.hard_cap_temp}C, poll={args.poll_interval}s.")
+    log(f"Starting. Monitoring sensors {sensor_ids}. Curve: {args.base_speed}% at "
+        f"<={args.target_temp}C -> {args.max_speed}% at >={args.hard_cap_temp}C, "
+        f"fall rate {args.fall_rate}%/poll, hysteresis {args.temp_hysteresis}C, "
+        f"poll every {args.poll_interval}s, "
+        f"failsafe after {args.max_failed_polls} failed polls.")
 
-    ipmi.set_manual_mode()
-    ipmi.set_fan_speed(controller.current_speed)
-    log(f"Manual mode enabled. Initial fan speed set to {controller.current_speed}%.")
-
-    while True:
-        time.sleep(args.poll_interval)
-        try:
-            readings = ipmi.read_temps(sensor_ids)
-            if not readings:
-                log(f"No readings found for sensors {sensor_ids}. Check sensor IDs with "
-                    f"'ipmitool sdr type Temperature'. Skipping this poll.", level="WARNING")
-                continue
-
-            max_temp = max(readings.values())
-            new_speed = controller.evaluate(max_temp)
-
-            if new_speed != getattr(main, "_last_applied", None):
-                ipmi.set_fan_speed(new_speed)
-                main._last_applied = new_speed
-
-            log(f"Readings: {readings} | max={max_temp}C | speed={controller.current_speed}% | "
-                f"ceiling={controller.ceiling_for(controller.current_speed)}C")
-
-        except subprocess.TimeoutExpired:
-            log("ipmitool call timed out. Skipping this poll.", level="WARNING")
-        except RuntimeError as e:
-            log(f"IPMI error: {e}. Skipping this poll.", level="WARNING")
-        except Exception as e:
-            log(f"Unexpected error: {e}. Skipping this poll.", level="ERROR")
+    engaged = False
+    try:
+        ipmi.set_manual_mode()
+        engaged = True
+        ipmi.set_fan_speed(int(controller.current_speed))
+        log(f"Manual mode enabled. Initial fan speed set to {int(controller.current_speed)}%.")
+        run_loop(ipmi, controller, sensor_ids, args.poll_interval, args.max_failed_polls)
+    finally:
+        # Don't let a second Ctrl-C interrupt the revert.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if engaged:
+            cleanup(ipmi, args.revert_on_exit, args.exit_speed)
 
 
 if __name__ == "__main__":
