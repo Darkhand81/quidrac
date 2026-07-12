@@ -51,7 +51,8 @@ SAFETY / FAILURE HANDLING:
     commands are cheap and idempotent), so an iDRAC reset -- firmware
     update, racreset, watchdog -- can't silently drop the override while
     we keep believing it's active.
-  - Cleanup (revert to auto, or hold --exit-speed) runs in a finally
+  - Cleanup (revert to auto, hold --exit-speed, or leave the fans at
+    their last applied speed with --exit-speed current) runs in a finally
     block, so it happens on SIGINT/SIGTERM *and* on crashes, not just
     clean signals.
 
@@ -129,7 +130,10 @@ DEFAULT_TEMP_HYSTERESIS = 2.0      # Temp must fall this far below its recent pe
 
 DEFAULT_MAX_FAILED_POLLS = 5       # Consecutive failed polls before failsafe revert to auto
 DEFAULT_REVERT_ON_EXIT = True      # Revert to automatic iDRAC fan control on exit
-DEFAULT_EXIT_SPEED = DEFAULT_BASE_SPEED  # If REVERT_ON_EXIT is False, hold this speed (%) on exit instead
+CURRENT_SPEED = "current"          # Sentinel: leave fans at their last applied speed
+DEFAULT_EXIT_SPEED = DEFAULT_BASE_SPEED  # If REVERT_ON_EXIT is False, hold this speed (%) on
+                                         # exit -- or set to CURRENT_SPEED to leave the fans
+                                         # exactly where the loop last put them
 
 DEFAULT_WEB_BIND = "0.0.0.0"       # Web UI bind address ("127.0.0.1" for local-only)
 DEFAULT_WEB_PORT = 8080            # Web UI port
@@ -176,6 +180,20 @@ def read_settings_overrides(path):
     except (OSError, ValueError, json.JSONDecodeError) as e:
         log(f"Ignoring settings file {path}: {e}.", level="WARNING")
         return {}
+
+
+def exit_speed_type(value):
+    """argparse type for --exit-speed: a 0-100 percentage, or 'current'
+    to leave the fans at whatever speed the loop last applied."""
+    if str(value).strip().lower() == CURRENT_SPEED:
+        return CURRENT_SPEED
+    try:
+        speed = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected a percentage or '{CURRENT_SPEED}', got {value!r}")
+    if not 0 <= speed <= 100:
+        raise argparse.ArgumentTypeError(f"must be 0-100 or '{CURRENT_SPEED}'")
+    return speed
 
 
 def parse_sensor_aliases(text):
@@ -576,8 +594,17 @@ def run_loop(ipmi, controller, state, sensor_ids):
 
 
 def cleanup(ipmi, revert_on_exit, exit_speed, attempts=3):
-    """Hand control back to iDRAC (or pin the exit speed). Retries because
-    this is the last line of defense before the process goes away."""
+    """Hand control back to iDRAC, pin the exit speed, or -- with
+    exit_speed=CURRENT_SPEED -- leave everything exactly as-is. Retries
+    because this is the last line of defense before the process goes away."""
+    if not revert_on_exit and exit_speed == CURRENT_SPEED:
+        # Deliberately touch nothing: the iDRAC keeps manual mode at the
+        # last speed the loop applied (or automatic mode, if the failsafe
+        # had already handed control back).
+        log("Exiting without changing fan control: fans stay at the last "
+            "applied speed (exit-speed=current). Nothing is watching "
+            "temperatures now.", level="WARNING")
+        return
     for attempt in range(1, attempts + 1):
         try:
             if revert_on_exit:
@@ -1368,8 +1395,9 @@ def main():
                         help="Revert to automatic iDRAC fan control on exit (default: on)")
     parser.add_argument("--no-revert-on-exit", dest="revert_on_exit", action="store_false",
                         help="Do NOT revert to automatic control on exit; hold --exit-speed instead")
-    parser.add_argument("--exit-speed", type=int, default=DEFAULT_EXIT_SPEED,
-                        help="Fan speed %% to hold on exit when --no-revert-on-exit is set "
+    parser.add_argument("--exit-speed", type=exit_speed_type, default=DEFAULT_EXIT_SPEED,
+                        help="Fan speed %% to hold on exit when --no-revert-on-exit is set, "
+                             "or 'current' to leave the fans at their last applied speed "
                              f"(default: {DEFAULT_EXIT_SPEED})")
 
     parser.add_argument("--settings-file", default=None,
