@@ -72,9 +72,12 @@ in between                   →  linear interpolation
 
 Two asymmetric rules turn that curve into quiet-but-safe behavior:
 
-- **Rises are instant.** If the curve asks for a higher speed, it's applied on
-  that same poll. Hitting the hard cap jumps straight to max speed — there is
-  no gradual ramp during an emergency.
+- **Rises are fast but not abrupt.** A rise is spread evenly across
+  `--rise-splits` polls (default 2): a decision to raise the fans by 10%
+  applies 5% now and 5% next poll. If the curve asks for more mid-rise, the
+  step recomputes from the remaining gap. The exception is the emergency
+  path: at or above the hard cap, the jump to max speed is instant — no
+  smoothing.
 - **Falls are slow.** Speed decays at most `--fall-rate` percent per poll
   (default 2%/poll) and never below the curve. After a load spike passes, the
   fans drift down and settle at the *lowest* speed that holds the temperature
@@ -184,6 +187,7 @@ returns to the launch configuration (defaults + flags) and deletes the file.
 | `--target-temp` | 65 | Curve start (°C) |
 | `--hard-cap-temp` | 80 | Curve end (°C); at/above this, fans jump to max |
 | `--fall-rate` | 2.0 | Max fan % decrease per poll when cooling |
+| `--rise-splits` | 2 | Polls to spread each fan speed rise across (1 = instant; hard-cap rises are always instant) |
 | `--temp-hysteresis` | 2.0 | °C a temp must fall below its recent peak before fans follow (0 disables) |
 | `--poll-interval` | 10 | Seconds between polls |
 | `--max-failed-polls` | 5 | Failed polls before the failsafe reverts to automatic control |

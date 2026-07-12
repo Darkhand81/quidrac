@@ -23,9 +23,12 @@ STRATEGY (temperature -> speed curve with asymmetric slew):
         temp >= --hard-cap-temp   ->  --max-speed
         in between                ->  linear interpolation
 
-  - Rising temps take effect instantly: if the curve says a higher speed,
-    it is applied on that same poll (so hitting the hard cap jumps
-    straight to max speed -- no gradual ramp during an emergency).
+  - Rising temps act fast but not abruptly: a rise is spread evenly
+    across --rise-splits polls (default 2), so a decision to raise the
+    fans by 10% applies 5% now and 5% next poll. If the curve asks for
+    more mid-rise, the step is recomputed from the remaining gap.
+    EXCEPTION: at/above the hard cap the rise is applied instantly --
+    no smoothing during an emergency.
   - Falling temps decay slowly: speed drops by at most --fall-rate
     percent per poll, and never below the curve. The speed therefore
     settles at the lowest value that holds temperature at the curve --
@@ -121,6 +124,7 @@ DEFAULT_TARGET_TEMP = 65           # Curve start: temps at/below this run at bas
 DEFAULT_HARD_CAP_TEMP = 80         # Curve end: temps at/above this run at max speed (C)
 DEFAULT_MAX_SPEED = 100            # Maximum fan speed (%)
 DEFAULT_FALL_RATE = 2.0            # Max fan speed decrease per poll when cooling (%/poll)
+DEFAULT_RISE_SPLITS = 2            # Polls to spread each fan speed rise across (1 = instant)
 DEFAULT_TEMP_HYSTERESIS = 2.0      # Temp must fall this far below its recent peak before fans follow (C)
 
 DEFAULT_MAX_FAILED_POLLS = 5       # Consecutive failed polls before failsafe revert to auto
@@ -149,7 +153,8 @@ PARAM_SPEC = {
     "max_speed":        (int,   1,   100, "Max speed",       "%",      "Maximum fan speed"),
     "target_temp":      (float, 20,  105, "Target temp",     "°C", "Curve start: at/below this temp fans run at base speed"),
     "hard_cap_temp":    (float, 25,  110, "Hard cap temp",   "°C", "Curve end: at/above this temp fans jump to max speed"),
-    "fall_rate":        (float, 0.1, 100, "Fall rate",       "%/poll", "Max fan speed decrease per poll when cooling (rises are instant)"),
+    "fall_rate":        (float, 0.1, 100, "Fall rate",       "%/poll", "Max fan speed decrease per poll when cooling"),
+    "rise_splits":      (int,   1,   20,  "Rise splits",     "polls",  "Spread each fan speed rise across this many polls (1 = instant; hard-cap rises are always instant)"),
     "temp_hysteresis":  (float, 0,   20,  "Temp hysteresis", "°C", "Temp must fall this far below its recent peak before fans follow"),
     "poll_interval":    (int,   1,   300, "Poll interval",   "s",      "Seconds between sensor polls"),
     "max_failed_polls": (int,   1,   100, "Max failed polls", "",      "Consecutive failed polls before failsafe revert to auto"),
@@ -410,10 +415,11 @@ class DemoIpmi:
 class CurveController:
     """
     Temperature->speed curve plus asymmetric slew limiting: speed rises
-    instantly to the curve, but falls at most fall_rate percent per
-    poll. The curve is driven by a hysteresis-filtered control
-    temperature (rises instantly, falls only after a temp_hysteresis
-    drop) so single-degree sensor flicker doesn't bounce the fans.
+    toward the curve in rise_splits equal steps (instantly at/above the
+    hard cap), and falls at most fall_rate percent per poll. The curve
+    is driven by a hysteresis-filtered control temperature (rises
+    instantly, falls only after a temp_hysteresis drop) so
+    single-degree sensor flicker doesn't bounce the fans.
 
     Parameters are read live from SharedState each poll, so web-UI
     changes take effect immediately.
@@ -424,6 +430,8 @@ class CurveController:
         self.current_speed = float(state.get_params()["base_speed"])
         self.control_temp = None
         self.last_desired = self.current_speed
+        self._rise_target = None
+        self._rise_step = 0.0
 
     @staticmethod
     def curve(temp, p):
@@ -455,8 +463,20 @@ class CurveController:
         desired = self.curve(self.control_temp, p)
         self.last_desired = desired
         if desired > self.current_speed:
-            self.current_speed = desired
+            if self.control_temp >= p["hard_cap_temp"]:
+                # Emergency: no smoothing at/above the hard cap.
+                self.current_speed = desired
+                self._rise_target = None
+            else:
+                # Spread the rise evenly across rise_splits polls. If the
+                # curve target moves mid-rise, recompute the step from the
+                # remaining gap so the schedule restarts from here.
+                if self._rise_target != desired:
+                    self._rise_target = desired
+                    self._rise_step = (desired - self.current_speed) / max(1, p["rise_splits"])
+                self.current_speed = min(desired, self.current_speed + self._rise_step)
         else:
+            self._rise_target = None
             self.current_speed = max(desired, self.current_speed - p["fall_rate"])
         return int(round(self.current_speed))
 
@@ -1332,6 +1352,10 @@ def main():
     parser.add_argument("--fall-rate", type=float, default=argparse.SUPPRESS,
                         help=f"Max fan speed decrease per poll when cooling (%%/poll). "
                              f"Rises are always instant. (default: {DEFAULT_FALL_RATE})")
+    parser.add_argument("--rise-splits", type=int, default=argparse.SUPPRESS,
+                        help=f"Spread each fan speed rise across this many polls; "
+                             f"1 = instant. Rises at/above the hard cap are always "
+                             f"instant. (default: {DEFAULT_RISE_SPLITS})")
     parser.add_argument("--temp-hysteresis", type=float, default=argparse.SUPPRESS,
                         help=f"Temp must fall this many degrees below its recent peak "
                              f"before fans follow it down (C). Prevents fan bounce from "
@@ -1384,6 +1408,7 @@ def main():
         "target_temp": DEFAULT_TARGET_TEMP,
         "hard_cap_temp": DEFAULT_HARD_CAP_TEMP,
         "fall_rate": DEFAULT_FALL_RATE,
+        "rise_splits": DEFAULT_RISE_SPLITS,
         "temp_hysteresis": DEFAULT_TEMP_HYSTERESIS,
         "poll_interval": DEFAULT_POLL_INTERVAL,
         "max_failed_polls": DEFAULT_MAX_FAILED_POLLS,
