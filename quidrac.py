@@ -94,6 +94,7 @@ import os
 import random
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -140,6 +141,8 @@ DEFAULT_WEB_PORT = 8080            # Web UI port
 HISTORY_MAX_SAMPLES = 20000        # Rolling history kept for the charts (~55h at 10s polls)
 SETTINGS_FILENAME = "quidrac-settings.json"  # Web UI overrides, saved next to this script
 # ---------------------------------------------------------------------------
+
+HOSTNAME = socket.gethostname()    # Shown in the dashboard header
 
 
 def log(msg, level="INFO"):
@@ -656,6 +659,7 @@ def start_web_server(state, bind, port):
                 except ValueError:
                     since = 0.0
                 snap = state.snapshot(since=since)
+                snap["hostname"] = HOSTNAME
                 snap["param_spec"] = {
                     name: {"type": ptype.__name__, "min": lo, "max": hi,
                            "label": label, "unit": unit, "help": help_}
@@ -840,6 +844,7 @@ th:first-child, td:first-child { text-align: left; }
 <header>
   <h1>quidrac</h1>
   <span class="sub">iDRAC fan control</span>
+  <span class="sub" id="hostname"></span>
   <span class="chip" id="chip"><span class="dot" id="chipdot"></span><span id="chiptext">connecting…</span></span>
 </header>
 
@@ -913,7 +918,7 @@ async function poll() {
     const j = await r.json();
     S.params = j.params; S.spec = j.param_spec; S.status = j.status; S.now = j.now;
     S.settingsFile = j.settings_file; S.overridesActive = j.overrides_active;
-    S.aliases = j.aliases || {};
+    S.aliases = j.aliases || {}; S.hostname = j.hostname || "";
     if (j.samples.length) {
       S.samples.push(...j.samples);
       S.lastT = j.samples[j.samples.length - 1].t;
@@ -941,6 +946,10 @@ function setChip(color, text) {
 function fmtTemp(v) { return v == null ? "–" : v + "°C"; }
 
 function render() {
+  if (S.hostname && $("hostname").textContent !== "· " + S.hostname) {
+    $("hostname").textContent = "· " + S.hostname;
+    document.title = "quidrac — " + S.hostname;
+  }
   const st = S.status || {};
   if (st.state === "running") setChip(css("--good"), st.demo ? "running (demo)" : "running");
   else if (st.state === "degraded") setChip(css("--warning"), "degraded — " + st.consecutive_failures + " failed poll" + (st.consecutive_failures === 1 ? "" : "s"));
