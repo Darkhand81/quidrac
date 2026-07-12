@@ -158,11 +158,11 @@ def log(msg, level="INFO"):
 PARAM_SPEC = {
     "base_speed":       (int,   0,   100, "Base speed",      "%",      "Minimum fan speed, used at/below target temp"),
     "max_speed":        (int,   1,   100, "Max speed",       "%",      "Maximum fan speed"),
-    "target_temp":      (float, 20,  105, "Target temp",     "°C", "Curve start: at/below this temp fans run at base speed"),
-    "hard_cap_temp":    (float, 25,  110, "Hard cap temp",   "°C", "Curve end: at/above this temp fans jump to max speed"),
+    "target_temp":      (float, 20,  105, "Target temp",     "\u00b0C", "Curve start: at/below this temp fans run at base speed"),
+    "hard_cap_temp":    (float, 25,  110, "Hard cap temp",   "\u00b0C", "Curve end: at/above this temp fans jump to max speed"),
     "fall_rate":        (float, 0.1, 100, "Fall rate",       "%/poll", "Max fan speed decrease per poll when cooling"),
     "rise_splits":      (int,   1,   20,  "Rise splits",     "polls",  "Spread each fan speed rise across this many polls (1 = instant; hard-cap rises are always instant)"),
-    "temp_hysteresis":  (float, 0,   20,  "Temp hysteresis", "°C", "Temp must fall this far below its recent peak before fans follow"),
+    "temp_hysteresis":  (float, 0,   20,  "Temp hysteresis", "\u00b0C", "Temp must fall this far below its recent peak before fans follow"),
     "poll_interval":    (int,   1,   300, "Poll interval",   "s",      "Seconds between sensor polls"),
     "max_failed_polls": (int,   1,   100, "Max failed polls", "",      "Consecutive failed polls before failsafe revert to auto"),
 }
@@ -723,7 +723,7 @@ HTML_PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:,">
-<title>quidrac — iDRAC fan control</title>
+<title>quidrac &mdash; iDRAC fan control</title>
 <style>
 :root {
   --page:      #f9f9f7;
@@ -845,14 +845,14 @@ th:first-child, td:first-child { text-align: left; }
   <h1>quidrac</h1>
   <span class="sub">iDRAC fan control</span>
   <span class="sub" id="hostname"></span>
-  <span class="chip" id="chip"><span class="dot" id="chipdot"></span><span id="chiptext">connecting…</span></span>
+  <span class="chip" id="chip"><span class="dot" id="chipdot"></span><span id="chiptext">connecting&hellip;</span></span>
 </header>
 
 <div class="tiles">
-  <div class="tile"><div class="label">Fan speed</div><div class="value" id="tSpeed">–</div><div class="note" id="tSpeedNote"></div></div>
-  <div class="tile"><div class="label">Hottest sensor</div><div class="value" id="tMax">–</div><div class="note" id="tMaxNote"></div></div>
-  <div class="tile"><div class="label">Control temp</div><div class="value" id="tCtrl">–</div><div class="note">hysteresis-filtered</div></div>
-  <div class="tile"><div class="label">Headroom to hard cap</div><div class="value" id="tHead">–</div><div class="note" id="tHeadNote"></div></div>
+  <div class="tile"><div class="label">Fan speed</div><div class="value" id="tSpeed">&ndash;</div><div class="note" id="tSpeedNote"></div></div>
+  <div class="tile"><div class="label">Hottest sensor</div><div class="value" id="tMax">&ndash;</div><div class="note" id="tMaxNote"></div></div>
+  <div class="tile"><div class="label">Control temp</div><div class="value" id="tCtrl">&ndash;</div><div class="note">hysteresis-filtered</div></div>
+  <div class="tile"><div class="label">Headroom to hard cap</div><div class="value" id="tHead">&ndash;</div><div class="note" id="tHeadNote"></div></div>
 </div>
 
 <div class="filterrow" id="ranges">
@@ -943,17 +943,17 @@ function setChip(color, text) {
   $("chiptext").textContent = text;
 }
 
-function fmtTemp(v) { return v == null ? "–" : v + "°C"; }
+function fmtTemp(v) { return v == null ? "\u2013" : v + "\u00b0C"; }
 
 function render() {
-  if (S.hostname && $("hostname").textContent !== "· " + S.hostname) {
-    $("hostname").textContent = "· " + S.hostname;
-    document.title = "quidrac — " + S.hostname;
+  if (S.hostname && $("hostname").textContent !== "\u00b7 " + S.hostname) {
+    $("hostname").textContent = "\u00b7 " + S.hostname;
+    document.title = "quidrac \u2014 " + S.hostname;
   }
   const st = S.status || {};
   if (st.state === "running") setChip(css("--good"), st.demo ? "running (demo)" : "running");
-  else if (st.state === "degraded") setChip(css("--warning"), "degraded — " + st.consecutive_failures + " failed poll" + (st.consecutive_failures === 1 ? "" : "s"));
-  else if (st.state === "failsafe") setChip(css("--critical"), "FAILSAFE — auto control");
+  else if (st.state === "degraded") setChip(css("--warning"), "degraded \u2014 " + st.consecutive_failures + " failed poll" + (st.consecutive_failures === 1 ? "" : "s"));
+  else if (st.state === "failsafe") setChip(css("--critical"), "FAILSAFE \u2014 auto control");
   else setChip(css("--muted"), st.state || "starting");
 
   const last = S.samples[S.samples.length - 1];
@@ -965,13 +965,13 @@ function render() {
     $("tMaxNote").textContent = aliasOf(hot);
     $("tCtrl").textContent = fmtTemp(last.ctrl);
     const head = last.cap - last.max;
-    $("tHead").textContent = head + "°C";
-    $("tHeadNote").textContent = "hard cap at " + last.cap + "°C";
+    $("tHead").textContent = head + "\u00b0C";
+    $("tHeadNote").textContent = "hard cap at " + last.cap + "\u00b0C";
   }
   if (S.settingsFile) {
     $("pdesc").textContent = "Applied on the next poll and saved to " + S.settingsFile +
       (S.overridesActive ? " (overriding script settings). " : ". ") +
-      "“Restore script settings” returns to CLI flags/defaults and removes the file.";
+      "\u201cRestore script settings\u201d returns to CLI flags/defaults and removes the file.";
   }
   drawTemps(); drawSpeed();
   if (S.tableOn) renderTable();
@@ -1053,7 +1053,7 @@ function drawChart(canvas, seriesList, yLo, yHi, unit) {
 
   if (!rows.length) {
     ctx.fillStyle = css("--muted"); ctx.textAlign = "center"; ctx.textBaseline = "middle";
-    ctx.fillText("waiting for samples…", (PADL + w - PADR) / 2, h / 2);
+    ctx.fillText("waiting for samples\u2026", (PADL + w - PADR) / 2, h / 2);
     return { rows, X, Y };
   }
 
@@ -1143,7 +1143,7 @@ function drawTemps() {
   }
   if (!isFinite(lo)) { lo = 30; hi = 90; }
   const pad = Math.max(2, (hi - lo) * 0.08);
-  geomT = drawChart($("chartT"), series, Math.floor(lo - pad), Math.ceil(hi + pad), "°");
+  geomT = drawChart($("chartT"), series, Math.floor(lo - pad), Math.ceil(hi + pad), "\u00b0");
   renderLegend($("legendT"), series);
 }
 
@@ -1223,7 +1223,7 @@ function renderTable() {
   const thead = $("stable").querySelector("thead");
   const tbody = $("stable").querySelector("tbody");
   const tr = document.createElement("tr");
-  for (const htext of ["Time", ...S.sensorIds.map(s => aliasOf(s) + " °C"), "Control °C", "Speed %", "Curve %", "Target °C", "Cap °C"]) {
+  for (const htext of ["Time", ...S.sensorIds.map(s => aliasOf(s) + " \u00b0C"), "Control \u00b0C", "Speed %", "Curve %", "Target \u00b0C", "Cap \u00b0C"]) {
     const th = document.createElement("th"); th.textContent = htext; tr.append(th);
   }
   thead.replaceChildren(tr);
@@ -1333,7 +1333,7 @@ $("tableBtn").addEventListener("click", () => {
 });
 $("applyBtn").addEventListener("click", applyParams);
 $("revertBtn").addEventListener("click", revertParams);
-attachHover($("chartT"), $("tipT"), tempSeries, "°C");
+attachHover($("chartT"), $("tipT"), tempSeries, "\u00b0C");
 attachHover($("chartS"), $("tipS"), speedSeries, "%");
 window.addEventListener("resize", render);
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
