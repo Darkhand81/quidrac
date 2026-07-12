@@ -134,7 +134,10 @@ handing control *back*:
   override while quidrac keeps believing it's active.
 - **Cleanup on every exit path.** On SIGINT/SIGTERM *and* on crashes, quidrac
   reverts to automatic control (or holds `--exit-speed` if you pass
-  `--no-revert-on-exit`), retrying up to three times.
+  `--no-revert-on-exit`), retrying up to three times. `--exit-speed current`
+  instead leaves the fans exactly where the loop last put them — the least
+  safe option, since that speed depends on the moment quidrac stopped and
+  nothing watches temperatures afterwards.
 - **External backstop.** Nothing can catch SIGKILL or a power loss, so under
   systemd add a stop hook that reverts to automatic control no matter how the
   unit died — see below.
@@ -192,7 +195,7 @@ returns to the launch configuration (defaults + flags) and deletes the file.
 | `--poll-interval` | 10 | Seconds between polls |
 | `--max-failed-polls` | 5 | Failed polls before the failsafe reverts to automatic control |
 | `--revert-on-exit` / `--no-revert-on-exit` | revert | On exit: hand control back to iDRAC, or hold `--exit-speed` |
-| `--exit-speed` | 30 | Fan % to hold on exit with `--no-revert-on-exit` |
+| `--exit-speed` | 30 | Fan % to hold on exit with `--no-revert-on-exit`, or `current` to leave fans at their last applied speed |
 | `--settings-file` | next to script | Where dashboard changes are saved |
 | `--web-bind` / `--web-port` / `--no-web` | `0.0.0.0:8080` | Dashboard exposure |
 | `--demo` | off | Simulated server — preview the dashboard and tuning with no hardware |
