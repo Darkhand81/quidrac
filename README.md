@@ -155,8 +155,10 @@ management LAN), served on `--web-port` 8080 by default:
   (~55 hours of history at the default poll interval).
 - Status tiles and a header chip that shows `running` / `degraded` /
   `FAILSAFE` at a glance.
-- **Every control parameter is editable live** — changes are validated, apply
-  on the next poll, and persist (see below).
+- **The control parameters are editable live** — changes are validated, apply
+  on the next poll, and persist (see below). (The failsafe threshold,
+  `--max-failed-polls`, is a safety setting configured only via the flag or
+  the script's `DEFAULT_MAX_FAILED_POLLS`, not the dashboard.)
 
 There is **no authentication**. Bind it to a trusted network only
 (`--web-bind 127.0.0.1` for local-only), or disable it with `--no-web`.

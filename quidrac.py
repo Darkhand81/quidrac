@@ -59,8 +59,8 @@ SAFETY / FAILURE HANDLING:
 WEB INTERFACE:
   A built-in dashboard (stdlib http.server, zero dependencies, works
   offline) serves live charts of temperatures, control temperature,
-  target/hard-cap thresholds, and fan speed, plus a form to tweak every
-  control parameter at runtime. Parameter changes apply on the next
+  target/hard-cap thresholds, and fan speed, plus a form to tweak the
+  control parameters at runtime. Parameter changes apply on the next
   poll and are saved to a settings file (default: quidrac-settings.json
   next to this script; override with --settings-file). At startup,
   settings resolve lowest-to-highest: script defaults -> settings file
@@ -164,8 +164,10 @@ PARAM_SPEC = {
     "rise_splits":      (int,   1,   20,  "Rise splits",     "polls",  "Spread each fan speed rise across this many polls (1 = instant; hard-cap rises are always instant)"),
     "temp_hysteresis":  (float, 0,   20,  "Temp hysteresis", "\u00b0C", "Temp must fall this far below its recent peak before fans follow"),
     "poll_interval":    (int,   1,   300, "Poll interval",   "s",      "Seconds between sensor polls"),
-    "max_failed_polls": (int,   1,   100, "Max failed polls", "",      "Consecutive failed polls before failsafe revert to auto"),
 }
+# max_failed_polls is intentionally NOT here: it's a config/flag-only safety
+# setting (DEFAULT_MAX_FAILED_POLLS / --max-failed-polls), kept out of the live
+# web form and the settings file.
 
 
 def read_settings_overrides(path):
@@ -510,7 +512,7 @@ def fmt_readings(readings, aliases):
     return ", ".join(f"{aliases.get(sid, sid)}={v}C" for sid, v in readings.items())
 
 
-def run_loop(ipmi, controller, state, sensor_ids):
+def run_loop(ipmi, controller, state, sensor_ids, max_failed_polls):
     consecutive_failures = 0
     failsafe = False           # too many failures; trying to hand back to iDRAC
     failsafe_engaged = False   # the revert-to-auto command actually succeeded
@@ -568,13 +570,13 @@ def run_loop(ipmi, controller, state, sensor_ids):
 
         except Exception as e:
             consecutive_failures += 1
-            log(f"Poll failed ({consecutive_failures}/{p['max_failed_polls']}): {e}",
+            log(f"Poll failed ({consecutive_failures}/{max_failed_polls}): {e}",
                 level="WARNING")
             state.set_status(state="failsafe" if failsafe else "degraded",
                              consecutive_failures=consecutive_failures,
                              last_error=str(e))
 
-            if consecutive_failures >= p["max_failed_polls"] and not failsafe:
+            if consecutive_failures >= max_failed_polls and not failsafe:
                 log(f"{consecutive_failures} consecutive failed polls -- flying blind. "
                     f"Failsafe: reverting to automatic iDRAC fan control.", level="CRITICAL")
                 failsafe = True
@@ -1369,7 +1371,7 @@ def main():
                              'e.g. "0Eh=CPU1,0Fh=CPU2". Merged over the SENSOR_ALIASES '
                              'dict in this script (flag wins per sensor).')
 
-    # The eight tunable parameters use default=argparse.SUPPRESS so we can
+    # The seven live-tunable parameters use default=argparse.SUPPRESS so we can
     # tell "explicitly passed" apart from "left at default": explicit flags
     # outrank the settings file, script defaults sit below it.
     parser.add_argument("--poll-interval", type=int, default=argparse.SUPPRESS,
@@ -1396,7 +1398,8 @@ def main():
                         help=f"Temp must fall this many degrees below its recent peak "
                              f"before fans follow it down (C). Prevents fan bounce from "
                              f"1C sensor flicker; 0 disables. (default: {DEFAULT_TEMP_HYSTERESIS})")
-    parser.add_argument("--max-failed-polls", type=int, default=argparse.SUPPRESS,
+    # Config/flag-only (not live-tunable, not in the web UI or settings file).
+    parser.add_argument("--max-failed-polls", type=int, default=DEFAULT_MAX_FAILED_POLLS,
                         help=f"Consecutive failed polls before the failsafe reverts "
                              f"iDRAC to automatic fan control (default: {DEFAULT_MAX_FAILED_POLLS})")
     parser.add_argument("--revert-on-exit", dest="revert_on_exit", action="store_true",
@@ -1448,8 +1451,9 @@ def main():
         "rise_splits": DEFAULT_RISE_SPLITS,
         "temp_hysteresis": DEFAULT_TEMP_HYSTERESIS,
         "poll_interval": DEFAULT_POLL_INTERVAL,
-        "max_failed_polls": DEFAULT_MAX_FAILED_POLLS,
     }
+    if args.max_failed_polls < 1:
+        parser.error("--max-failed-polls must be at least 1")
     explicit = {n: getattr(args, n) for n in PARAM_SPEC if hasattr(args, n)}
     try:
         baseline = validate_params({**script_defaults, **explicit})
@@ -1502,7 +1506,7 @@ def main():
         f"Curve: {p['base_speed']}% at <={p['target_temp']}C -> {p['max_speed']}% at "
         f">={p['hard_cap_temp']}C, fall rate {p['fall_rate']}%/poll, hysteresis "
         f"{p['temp_hysteresis']}C, poll every {p['poll_interval']}s, failsafe after "
-        f"{p['max_failed_polls']} failed polls.")
+        f"{args.max_failed_polls} failed polls.")
 
     if args.web:
         try:
@@ -1519,7 +1523,7 @@ def main():
         engaged = True
         ipmi.set_fan_speed(int(controller.current_speed))
         log(f"Manual mode enabled. Initial fan speed set to {int(controller.current_speed)}%.")
-        run_loop(ipmi, controller, state, sensor_ids)
+        run_loop(ipmi, controller, state, sensor_ids, args.max_failed_polls)
     finally:
         # Don't let a second Ctrl-C interrupt the revert.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
