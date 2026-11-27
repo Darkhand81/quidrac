@@ -844,6 +844,7 @@ class NativeIpmi:
         self._lock = threading.Lock()
         self._sensors = None           # {sensor_id: SdrSensor}, read once
         self._warned_missing = set()
+        self._sdr_size = 0             # index into SDR_READ_SIZES that the BMC accepts
         self.logins = 0
 
     def _connect(self, reason=None):
@@ -908,44 +909,64 @@ class NativeIpmi:
     def set_fan_speed(self, percent):
         self._cmd(0x30, 0x30, [0x02, 0xFF, max(0, min(100, int(percent)))])
 
-    def _read_sdr_record(self, record_id, chunk):
-        """Return (next_record_id, record_bytes), shrinking the read size
-        if the BMC can't return as much as we asked for."""
-        while True:
-            res = self._cmd(0x0A, 0x22)[:2]          # Reserve SDR Repository
+    def _get_sdr(self, res, record_id, offset, count):
+        return self._cmd(0x0A, 0x23, res + struct.pack("<HBB", record_id, offset, count))
+
+    # Get SDR read sizes to try, largest first (FFh = "entire record"). BMCs
+    # cap how much one response may carry; we settle on the largest size the
+    # BMC accepts and keep it for the rest of the walk.
+    SDR_READ_SIZES = (0xFF, 64, 48, 32, 24, 16, 8)
+
+    def _read_sdr_record(self, res, record_id):
+        """Return (next_record_id, record_bytes) in as few requests as the
+        BMC allows: one if it returns whole records, otherwise the first
+        chunk (header included) plus the remainder. Raises IpmiError 0xC5
+        if the reservation was lost."""
+        rec, next_id, total = bytearray(), None, None
+        while total is None or len(rec) < total:
+            size = self.SDR_READ_SIZES[self._sdr_size]
+            want = size if total is None else min(size, total - len(rec))
             try:
-                hdr = self._cmd(0x0A, 0x23, res + struct.pack("<HBB", record_id, 0, 5))
-                next_id = struct.unpack_from("<H", hdr)[0]
-                rec = bytearray(hdr[2:7])
-                total = 5 + rec[4]
-                while len(rec) < total:
-                    n = min(chunk[0], total - len(rec))
-                    try:
-                        part = self._cmd(0x0A, 0x23, res + struct.pack("<HBB", record_id,
-                                                                       len(rec), n))
-                    except IpmiError as e:
-                        if e.code in (0xCA, 0xC7, 0xFF) and chunk[0] > 4:
-                            chunk[0] //= 2
-                            continue
-                        raise
-                    rec += part[2:]
-                return next_id, bytes(rec[:total])
+                part = self._get_sdr(res, record_id, len(rec), want)
             except IpmiError as e:
-                if e.code == 0xC5:   # reservation lost (someone else read the SDR); retry
+                if (e.code in (0xCA, 0xC7, 0xC8, 0xCC, 0xFF)
+                        and self._sdr_size < len(self.SDR_READ_SIZES) - 1):
+                    self._sdr_size += 1
                     continue
                 raise
+            if len(part) <= 2:
+                raise IpmiError(f"empty SDR read for record 0x{record_id:04x}")
+            next_id = struct.unpack_from("<H", part)[0]
+            rec += part[2:]
+            if total is None and len(rec) >= 5:
+                total = 5 + rec[4]
+        return next_id, bytes(rec[:total])
 
-    def load_sensors(self):
-        """Walk the SDR repository once, keeping BMC-owned temperature
-        sensors. The SDR is static, so this survives reconnects."""
-        sensors, record_id, chunk, seen = {}, 0x0000, [16], 0
+    def load_sensors(self, wanted=None):
+        """Walk the SDR repository, keeping BMC-owned temperature sensors.
+        With `wanted` (normalized sensor IDs), stop as soon as all of them
+        are found. The SDR is static, so the result survives reconnects."""
+        wanted = set(wanted) if wanted else None
+        sensors, record_id, seen, lost = {}, 0x0000, 0, 0
+        res = self._cmd(0x0A, 0x22)[:2]                  # Reserve SDR Repository
         while record_id != 0xFFFF and seen < 1024:
-            next_id, rec = self._read_sdr_record(record_id, chunk)
+            try:
+                next_id, rec = self._read_sdr_record(res, record_id)
+            except IpmiError as e:
+                # Reservation lost (something else touched the SDR, or we
+                # re-logged in): reserve again and retry this record.
+                if e.code == 0xC5 and lost < 10:
+                    lost += 1
+                    res = self._cmd(0x0A, 0x22)[:2]
+                    continue
+                raise
             seen += 1
             if (len(rec) >= 48 and rec[3] == 0x01 and rec[5] == self.BMC_ADDR
                     and rec[12] == self.SENSOR_TYPE_TEMPERATURE):
                 s = SdrSensor(rec)
                 sensors.setdefault(s.sensor_id, s)
+                if wanted and wanted <= sensors.keys():
+                    break
             if next_id == record_id:
                 break
             record_id = next_id
@@ -966,7 +987,7 @@ class NativeIpmi:
 
     def read_temps(self, sensor_ids):
         if self._sensors is None:
-            self.load_sensors()
+            self.load_sensors({normalize_sensor_id(sid) for sid in sensor_ids})
         readings = {}
         for sid in sensor_ids:
             sensor = self._sensors.get(normalize_sensor_id(sid))
