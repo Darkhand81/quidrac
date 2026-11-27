@@ -13,8 +13,8 @@ automatically. For belt-and-braces safety under systemd, also add an
 external backstop that reverts to automatic control if the unit stops
 for any reason:
 
-    ExecStopPost=/usr/bin/ipmitool -I lanplus -H <host> -U <user> -E \\
-        raw 0x30 0x30 0x01 0x01
+    ExecStopPost=/usr/local/bin/quidrac.py --host <host> --user <user> \\
+        --revert-to-auto
 
 STRATEGY (temperature -> speed curve with asymmetric slew):
   - Fan speed is a pure function of the hottest monitored sensor:
@@ -78,16 +78,30 @@ DEMO MODE:
   a real iDRAC -- useful for previewing the dashboard and tuning
   parameters without hardware. No credentials required.
 
+IPMI TRANSPORT:
+  The default --ipmi-backend native is a built-in IPMI 2.0 / RMCP+
+  client (the protocol `ipmitool -I lanplus` speaks, AES-encrypted and
+  HMAC-authenticated) that logs in ONCE and keeps that session for every
+  poll, instead of a full login handshake per command. If the session
+  dies (iDRAC reset, network drop) the next command times out, logs in
+  again and retries; a session idle longer than 30s is replaced rather
+  than trusted. --ipmi-backend ipmitool restores the old behavior of
+  running ipmitool for each command. --list-sensors prints the iDRAC's
+  temperature sensors, a handy first connection test.
+
 CREDENTIALS:
   Prefer setting the IPMI_PASSWORD environment variable over passing
   --password on the command line (argv is visible to every local user
-  via ps). Either way, the password is handed to ipmitool through its
-  environment (-E), never on the ipmitool command line.
+  via ps). With --ipmi-backend ipmitool, the password is handed to
+  ipmitool through its environment (-E), never on its command line.
 
-Requires: ipmitool, IPMI-over-LAN enabled in iDRAC.
+Requires: IPMI-over-LAN enabled in iDRAC. Python 3 standard library
+only; ipmitool is needed only for --ipmi-backend ipmitool.
 """
 
 import argparse
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -95,6 +109,7 @@ import random
 import re
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -113,8 +128,11 @@ from urllib.parse import urlparse, parse_qs
 DEFAULT_HOST = None                # e.g. "192.168.1.100" (still required via --host if left None)
 DEFAULT_USER = None                # e.g. "root"
 DEFAULT_PASSWORD = None            # prefer the IPMI_PASSWORD env var over hardcoding here
+DEFAULT_PORT = 623                 # IPMI-over-LAN (RMCP+) UDP port
+DEFAULT_IPMI_BACKEND = "native"    # "native": built-in client, one persistent session.
+                                   # "ipmitool": shell out per command (a fresh login each time).
 
-DEFAULT_SENSORS = "0Eh,0Fh"        # Sensor IDs to monitor (see `ipmitool sdr list`)
+DEFAULT_SENSORS = "0Eh,0Fh"        # Sensor IDs to monitor (see --list-sensors)
 SENSOR_ALIASES = {                 # Friendly names shown in the dashboard and logs.
     "0Eh": "CPU1",                 # Edit here or pass --sensor-aliases "0Eh=CPU1,..."
     "0Fh": "CPU2",                 # (flag entries win). Unlisted sensors show their raw ID.
@@ -339,9 +357,651 @@ class SharedState:
 # IPMI backends
 # ---------------------------------------------------------------------------
 
-class IdracIpmi:
-    def __init__(self, host, user, password, interface="lanplus"):
+# ---------------------------------------------------------------------------
+# Native IPMI 2.0 / RMCP+ client (standard library only)
+#
+# Speaks the same wire protocol as `ipmitool -I lanplus`, but holds ONE
+# authenticated session open across polls instead of logging in afresh
+# for every command. Implements what this script needs and no more:
+# RAKP session setup with cipher suite 3 (HMAC-SHA1 / HMAC-SHA1-96 /
+# AES-CBC-128) or 17 (HMAC-SHA256 / HMAC-SHA256-128 / AES-CBC-128),
+# arbitrary request/response commands, SDR repository reads, and sensor
+# reading conversion. References: IPMI v2.0 rev 1.1 spec, sections 13
+# (LAN interface / RMCP+), 33 (SDR repository) and 35-36 (sensors).
+# ---------------------------------------------------------------------------
+
+def _aes_build_tables():
+    def xtime(a):
+        a <<= 1
+        return (a ^ 0x11B) if a & 0x100 else a
+
+    def gmul(a, b):
+        r = 0
+        while b:
+            if b & 1:
+                r ^= a
+            a = xtime(a)
+            b >>= 1
+        return r
+
+    sbox = [0] * 256
+    for x in range(256):
+        inv = 0
+        if x:
+            inv, base, e = 1, x, 254          # x^254 == x^-1 in GF(2^8)
+            while e:
+                if e & 1:
+                    inv = gmul(inv, base)
+                base = gmul(base, base)
+                e >>= 1
+        s = inv
+        for _ in range(4):
+            inv = ((inv << 1) | (inv >> 7)) & 0xFF
+            s ^= inv
+        sbox[x] = s ^ 0x63
+    inv_sbox = [0] * 256
+    for i, v in enumerate(sbox):
+        inv_sbox[v] = i
+    mul = {k: [gmul(i, k) for i in range(256)] for k in (2, 3, 9, 11, 13, 14)}
+    return sbox, inv_sbox, mul
+
+
+_AES_SBOX, _AES_INV_SBOX, _AES_MUL = _aes_build_tables()
+
+
+class _Aes128:
+    """Minimal pure-Python AES-128 block cipher (FIPS-197). Slow by crypto
+    standards, but RMCP+ packets are a few blocks each, a handful of times
+    per poll -- microseconds that don't matter. Exists only so the native
+    backend needs nothing outside the standard library."""
+
+    def __init__(self, key):
+        if len(key) != 16:
+            raise ValueError("AES-128 key must be 16 bytes")
+        w = list(key)
+        rcon = 1
+        while len(w) < 176:
+            t = w[-4:]
+            if len(w) % 16 == 0:
+                t = [_AES_SBOX[t[1]] ^ rcon, _AES_SBOX[t[2]], _AES_SBOX[t[3]], _AES_SBOX[t[0]]]
+                rcon = ((rcon << 1) ^ 0x11B) if rcon & 0x80 else rcon << 1
+            w.extend([w[-16 + i] ^ t[i] for i in range(4)])
+        self._rk = [w[16 * r:16 * r + 16] for r in range(11)]
+
+    def encrypt_block(self, block):
+        sb, m2, m3 = _AES_SBOX, _AES_MUL[2], _AES_MUL[3]
+        s = [b ^ k for b, k in zip(block, self._rk[0])]
+        for rnd in range(1, 11):
+            s = [sb[b] for b in s]
+            # ShiftRows (state is column-major: s[row + 4*col])
+            s = [s[(i + 4 * (i % 4)) % 16] for i in range(16)]
+            if rnd != 10:
+                t = []
+                for c in range(0, 16, 4):
+                    a0, a1, a2, a3 = s[c:c + 4]
+                    t += [m2[a0] ^ m3[a1] ^ a2 ^ a3, a0 ^ m2[a1] ^ m3[a2] ^ a3,
+                          a0 ^ a1 ^ m2[a2] ^ m3[a3], m3[a0] ^ a1 ^ a2 ^ m2[a3]]
+                s = t
+            s = [b ^ k for b, k in zip(s, self._rk[rnd])]
+        return bytes(s)
+
+    def decrypt_block(self, block):
+        isb = _AES_INV_SBOX
+        m9, m11, m13, m14 = _AES_MUL[9], _AES_MUL[11], _AES_MUL[13], _AES_MUL[14]
+        s = [b ^ k for b, k in zip(block, self._rk[10])]
+        for rnd in range(9, -1, -1):
+            s = [s[(i - 4 * (i % 4)) % 16] for i in range(16)]   # InvShiftRows
+            s = [isb[b] for b in s]
+            s = [b ^ k for b, k in zip(s, self._rk[rnd])]
+            if rnd != 0:
+                t = []
+                for c in range(0, 16, 4):
+                    a0, a1, a2, a3 = s[c:c + 4]
+                    t += [m14[a0] ^ m11[a1] ^ m13[a2] ^ m9[a3], m9[a0] ^ m14[a1] ^ m11[a2] ^ m13[a3],
+                          m13[a0] ^ m9[a1] ^ m14[a2] ^ m11[a3], m11[a0] ^ m13[a1] ^ m9[a2] ^ m14[a3]]
+                s = t
+        return bytes(s)
+
+    def cbc_encrypt(self, iv, data):
+        out, prev = bytearray(), iv
+        for i in range(0, len(data), 16):
+            prev = self.encrypt_block(bytes(a ^ b for a, b in zip(data[i:i + 16], prev)))
+            out += prev
+        return bytes(out)
+
+    def cbc_decrypt(self, iv, data):
+        out, prev = bytearray(), iv
+        for i in range(0, len(data), 16):
+            blk = data[i:i + 16]
+            out += bytes(a ^ b for a, b in zip(self.decrypt_block(blk), prev))
+            prev = blk
+        return bytes(out)
+
+
+IPMI_COMPLETION_CODES = {
+    0xC0: "node busy", 0xC1: "invalid command", 0xC2: "invalid for LUN",
+    0xC3: "timeout", 0xC4: "out of space", 0xC5: "reservation cancelled",
+    0xC6: "request data truncated", 0xC7: "request data length invalid",
+    0xC8: "request data field length limit exceeded",
+    0xC9: "parameter out of range", 0xCA: "cannot return number of requested bytes",
+    0xCB: "requested sensor, data, or record not present",
+    0xCC: "invalid data field in request", 0xCD: "command illegal for sensor or record type",
+    0xCE: "response could not be provided", 0xCF: "duplicated request",
+    0xD0: "SDR repository in update mode", 0xD1: "device in firmware update mode",
+    0xD2: "BMC initialization in progress", 0xD3: "destination unavailable",
+    0xD4: "insufficient privilege level", 0xD5: "not supported in present state",
+    0xD6: "sub-function disabled", 0xFF: "unspecified error",
+}
+
+RMCPPLUS_STATUS_CODES = {
+    0x01: "insufficient resources to create a session",
+    0x02: "invalid session ID", 0x03: "invalid payload type",
+    0x04: "invalid authentication algorithm", 0x05: "invalid integrity algorithm",
+    0x06: "no matching authentication payload", 0x07: "no matching integrity payload",
+    0x08: "inactive session ID", 0x09: "invalid role",
+    0x0A: "unauthorized role or privilege level requested",
+    0x0B: "insufficient resources to create a session at the requested role",
+    0x0C: "invalid name length", 0x0D: "unauthorized name (unknown user?)",
+    0x0E: "unauthorized GUID", 0x0F: "invalid integrity check value",
+    0x10: "invalid confidentiality algorithm",
+    0x11: "no cipher suite match with proposed security algorithms",
+    0x12: "illegal or unrecognized parameter",
+}
+
+
+class IpmiError(RuntimeError):
+    """An IPMI command completed with a non-zero completion code."""
+
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code
+
+
+class IpmiTimeout(RuntimeError):
+    """The BMC didn't answer (after retries)."""
+
+
+class RmcpPlusSession:
+    """One authenticated, integrity-protected, encrypted IPMI 2.0 session
+    over UDP/623. Not thread-safe by itself; NativeIpmi serializes use."""
+
+    # cipher suite -> (auth alg, integrity alg, confidentiality alg, hash, ICV/trailer length)
+    CIPHER_SUITES = {
+        3:  (0x01, 0x01, 0x01, hashlib.sha1, 12),
+        17: (0x03, 0x04, 0x01, hashlib.sha256, 16),
+    }
+    PRIV_ADMIN = 0x04
+    NAME_ONLY_LOOKUP = 0x10   # RAKP1 role flag: look the user up by name and privilege
+
+    def __init__(self, host, user, password, port=623, cipher_suite=3,
+                 kg=None, timeout=1.0, retries=3):
+        if cipher_suite not in self.CIPHER_SUITES:
+            raise ValueError(f"unsupported cipher suite {cipher_suite}")
+        self.host, self.port = host, port
+        self.user = user.encode()
+        self.password = password.encode()
+        if len(self.user) > 16:
+            raise ValueError("IPMI user names are limited to 16 bytes")
+        if len(self.password) > 20:
+            raise ValueError("IPMI 2.0 passwords are limited to 20 bytes")
+        # KG (the "BMC key"/"encryption key" in iDRAC settings) defaults to
+        # the user's password when the BMC has none configured (all zeros).
+        self.kg = kg if kg else self.password
+        self.cipher_suite = cipher_suite
+        self.timeout, self.retries = timeout, retries
+        self._sock = None
+        self.active = False
+
+    # -- framing helpers -------------------------------------------------
+
+    @staticmethod
+    def _checksum(data):
+        return (-sum(data)) & 0xFF
+
+    def _ipmi_msg(self, netfn, cmd, data, lun, rq_seq):
+        hdr = bytes([0x20, (netfn << 2) | (lun & 3)])
+        body = bytes([0x81, (rq_seq << 2), cmd]) + bytes(data)
+        return hdr + bytes([self._checksum(hdr)]) + body + bytes([self._checksum(body)])
+
+    def _send_raw(self, packet):
+        self._sock.send(packet)
+
+    def _exchange(self, build, match, what):
+        """Send build() (rebuilt each attempt, so retransmits get fresh
+        session sequence numbers) until match(datagram) returns a non-None
+        result. Stray/late datagrams that don't match are ignored."""
+        for _attempt in range(self.retries):
+            self._send_raw(build())
+            deadline = time.monotonic() + self.timeout
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._sock.settimeout(left)
+                try:
+                    pkt = self._sock.recv(4096)
+                except socket.timeout:
+                    break
+                except OSError:
+                    break   # e.g. ICMP port unreachable surfacing as ECONNREFUSED
+                result = match(pkt)
+                if result is not None:
+                    return result
+        raise IpmiTimeout(f"no response from BMC {self.host}:{self.port} ({what})")
+
+    # -- session setup ---------------------------------------------------
+
+    def _presession_packet(self, payload_type, payload):
+        return (b"\x06\x00\xff\x07" + bytes([0x06, payload_type]) + b"\x00" * 8
+                + struct.pack("<H", len(payload)) + payload)
+
+    def _presession_exchange(self, req_type, payload, rsp_type, tag, what):
+        def match(pkt):
+            if len(pkt) < 16 or pkt[:4] != b"\x06\x00\xff\x07" or pkt[4] != 0x06:
+                return None
+            if pkt[5] & 0x3F != rsp_type:
+                return None
+            (length,) = struct.unpack_from("<H", pkt, 14)
+            body = pkt[16:16 + length]
+            if len(body) < 2 or body[0] != tag:
+                return None
+            return body
+        body = self._exchange(lambda: self._presession_packet(req_type, payload), match, what)
+        if body[1] != 0:
+            raise IpmiError(f"{what} rejected by BMC: "
+                            f"{RMCPPLUS_STATUS_CODES.get(body[1], 'status 0x%02x' % body[1])}",
+                            body[1])
+        return body
+
+    def _get_channel_auth_caps(self):
+        """IPMI 1.5-framed, session-less. Confirms the BMC is there and
+        answering before we start the RAKP handshake (some BMCs expect it)."""
+        def build():
+            msg = self._ipmi_msg(0x06, 0x38, [0x8E, self.PRIV_ADMIN], 0, 0)
+            return b"\x06\x00\xff\x07" + b"\x00" + b"\x00" * 8 + bytes([len(msg)]) + msg
+
+        def match(pkt):
+            if len(pkt) < 21 or pkt[:4] != b"\x06\x00\xff\x07" or pkt[4] != 0x00:
+                return None
+            msg = pkt[14:14 + pkt[13]]
+            if len(msg) < 8 or msg[5] != 0x38:
+                return None
+            return msg
+        msg = self._exchange(build, match, "get channel auth capabilities")
+        if msg[6] != 0:
+            raise IpmiError("get channel auth capabilities failed: "
+                            f"{IPMI_COMPLETION_CODES.get(msg[6], 'code 0x%02x' % msg[6])}", msg[6])
+        if len(msg) > 8 and not msg[8] & 0x80:
+            raise IpmiError("BMC does not support IPMI v2.0 / RMCP+ (enable IPMI over LAN?)")
+
+    def open(self):
+        self.close()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.connect((self.host, self.port))
+        try:
+            self._handshake()
+        except Exception:
+            self.close(graceful=False)
+            raise
+
+    def _handshake(self):
+        auth_alg, integ_alg, conf_alg, hfunc, icv_len = self.CIPHER_SUITES[self.cipher_suite]
+        hmac_ = lambda key, data: hmac.new(key, data, hfunc).digest()
+
+        self._get_channel_auth_caps()
+
+        # Open Session
+        self.console_sid = struct.unpack("<I", os.urandom(4))[0] | 1
+        tag = os.urandom(1)[0]
+        payload = (bytes([tag, self.PRIV_ADMIN, 0, 0]) + struct.pack("<I", self.console_sid)
+                   + bytes([0x00, 0, 0, 8, auth_alg, 0, 0, 0])
+                   + bytes([0x01, 0, 0, 8, integ_alg, 0, 0, 0])
+                   + bytes([0x02, 0, 0, 8, conf_alg, 0, 0, 0]))
+        rsp = self._presession_exchange(0x10, payload, 0x11, tag, "open session")
+        if struct.unpack_from("<I", rsp, 4)[0] != self.console_sid:
+            raise IpmiError("open session response for a different console session")
+        self.bmc_sid = struct.unpack_from("<I", rsp, 8)[0]
+        sid_m, sid_c = struct.pack("<I", self.console_sid), struct.pack("<I", self.bmc_sid)
+
+        # RAKP 1/2
+        rm = os.urandom(16)
+        role = self.PRIV_ADMIN | self.NAME_ONLY_LOOKUP
+        tag = os.urandom(1)[0]
+        payload = (bytes([tag, 0, 0, 0]) + sid_c + rm + bytes([role, 0, 0, len(self.user)])
+                   + self.user)
+        rsp = self._presession_exchange(0x12, payload, 0x13, tag, "RAKP 1")
+        rc, guid_c, auth_code = rsp[8:24], rsp[24:40], rsp[40:]
+        tail = bytes([role, len(self.user)]) + self.user
+        if not hmac.compare_digest(auth_code, hmac_(self.password, sid_m + sid_c + rm + rc
+                                                   + guid_c + tail)):
+            raise IpmiError("RAKP 2 authentication failed: wrong password for user "
+                            f"'{self.user.decode(errors='replace')}'?")
+
+        # Session keys
+        self._sik = hmac_(self.kg, rm + rc + tail)
+        digest_len = hfunc().digest_size
+        self._k1 = hmac_(self._sik, b"\x01" * digest_len)
+        self._aes = _Aes128(hmac_(self._sik, b"\x02" * digest_len)[:16])
+        self._hfunc, self._icv_len = hfunc, icv_len
+
+        # RAKP 3/4
+        tag = os.urandom(1)[0]
+        payload = bytes([tag, 0, 0, 0]) + sid_c + hmac_(self.password, rc + sid_m + tail)
+        rsp = self._presession_exchange(0x14, payload, 0x15, tag, "RAKP 3")
+        if not hmac.compare_digest(rsp[8:8 + icv_len],
+                                   hmac_(self._sik, rm + sid_c + guid_c)[:icv_len]):
+            raise IpmiError("RAKP 4 integrity check failed (wrong KG / BMC key?)")
+
+        self._out_seq = 0
+        self._rq_seq = 0
+        self.active = True
+        # Sessions start at User privilege; raise to Administrator.
+        self.command(0x06, 0x3B, [self.PRIV_ADMIN])
+
+    # -- established session ---------------------------------------------
+
+    def _session_packet(self, msg):
+        self._out_seq = (self._out_seq + 1) & 0xFFFFFFFF or 1
+        iv = os.urandom(16)
+        pad = (16 - (len(msg) + 1) % 16) % 16
+        enc = iv + self._aes.cbc_encrypt(iv, msg + bytes(range(1, pad + 1)) + bytes([pad]))
+        sess = (bytes([0x06, 0xC0]) + struct.pack("<IIH", self.bmc_sid, self._out_seq, len(enc))
+                + enc)
+        ipad = (4 - (len(sess) + 2) % 4) % 4
+        sess += b"\xff" * ipad + bytes([ipad, 0x07])
+        return b"\x06\x00\xff\x07" + sess + hmac.new(self._k1, sess, self._hfunc).digest()[:self._icv_len]
+
+    def _parse_session_packet(self, pkt):
+        """Return the decrypted IPMI message, or None if this datagram isn't
+        a valid, authentic packet for our session."""
+        if len(pkt) < 16 or pkt[:4] != b"\x06\x00\xff\x07" or pkt[4] != 0x06:
+            return None
+        if pkt[5] & 0x3F != 0x00 or pkt[5] & 0xC0 != 0xC0:
+            return None
+        sid, _seq, length = struct.unpack_from("<IIH", pkt, 6)
+        if sid != self.console_sid:
+            return None
+        sess, icv = pkt[4:-self._icv_len], pkt[-self._icv_len:]
+        if not hmac.compare_digest(icv, hmac.new(self._k1, sess, self._hfunc).digest()[:self._icv_len]):
+            return None
+        enc = pkt[16:16 + length]
+        if len(enc) < 32 or len(enc) % 16:
+            return None
+        plain = self._aes.cbc_decrypt(enc[:16], enc[16:])
+        pad = plain[-1]
+        if pad > 15:
+            return None
+        return plain[:-(pad + 1)]
+
+    def command(self, netfn, cmd, data=(), lun=0):
+        """Send one request; return the response data (after the completion
+        code). Raises IpmiError on a non-zero completion code, IpmiTimeout
+        if the BMC doesn't answer."""
+        if not self.active:
+            raise IpmiError("IPMI session is not open")
+        self._rq_seq = (self._rq_seq + 1) & 0x3F
+        rq_seq = self._rq_seq
+        msg = self._ipmi_msg(netfn, cmd, data, lun, rq_seq)
+
+        def match(pkt):
+            m = self._parse_session_packet(pkt)
+            if (m is None or len(m) < 8 or m[1] >> 2 != netfn + 1 or m[4] >> 2 != rq_seq
+                    or m[5] != cmd):
+                return None
+            return m
+        rsp = self._exchange(lambda: self._session_packet(msg), match,
+                             f"netfn 0x{netfn:02x} cmd 0x{cmd:02x}")
+        code = rsp[6]
+        if code != 0:
+            raise IpmiError(f"IPMI netfn 0x{netfn:02x} cmd 0x{cmd:02x} failed: "
+                            f"{IPMI_COMPLETION_CODES.get(code, 'completion code 0x%02x' % code)}",
+                            code)
+        return rsp[7:-1]
+
+    def close(self, graceful=True):
+        """Best-effort Close Session, so we don't leave a slot occupied on
+        the BMC (they only have a handful). graceful=False skips that for a
+        session we believe is already dead."""
+        if self.active and graceful:
+            try:
+                saved_retries, self.retries = self.retries, 1
+                self.command(0x06, 0x3C, struct.pack("<I", self.bmc_sid))
+            except Exception:
+                pass
+            finally:
+                self.retries = saved_retries
+        self.active = False
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+
+
+def _sdr_twos(value, bits):
+    return value - (1 << bits) if value & (1 << (bits - 1)) else value
+
+
+_SDR_LINEARIZATION = {
+    0: lambda v: v, 1: math.log, 2: math.log10, 3: math.log2, 4: math.exp,
+    5: lambda v: 10 ** v, 6: lambda v: 2 ** v, 7: lambda v: 1 / v,
+    8: lambda v: v * v, 9: lambda v: v ** 3, 10: math.sqrt,
+    11: lambda v: math.copysign(abs(v) ** (1 / 3), v),
+}
+
+
+class SdrSensor:
+    """The fields of a Full Sensor Record (SDR type 0x01) needed to read
+    and convert one analog sensor."""
+
+    def __init__(self, rec):
+        self.owner = rec[5]
+        self.lun = rec[6] & 0x03
+        self.number = rec[7]
+        self.sensor_type = rec[12]
+        self.analog_format = rec[20] >> 6
+        self.unit = rec[21]
+        self.linearization = rec[23] & 0x7F
+        self.m = _sdr_twos(rec[24] | ((rec[25] & 0xC0) << 2), 10)
+        self.b = _sdr_twos(rec[26] | ((rec[27] & 0xC0) << 2), 10)
+        self.r_exp = _sdr_twos(rec[29] >> 4, 4)
+        self.b_exp = _sdr_twos(rec[29] & 0x0F, 4)
+        id_len = rec[47] & 0x1F if len(rec) > 47 else 0
+        self.name = rec[48:48 + id_len].decode("ascii", "replace").strip("\x00 ")
+
+    @property
+    def sensor_id(self):
+        return f"{self.number:02x}h"
+
+    def convert(self, raw):
+        if self.analog_format == 1:
+            raw = _sdr_twos(raw, 8) + (1 if raw & 0x80 else 0)  # one's complement
+        elif self.analog_format == 2:
+            raw = _sdr_twos(raw, 8)
+        elif self.analog_format == 3:
+            return None                                         # no analog reading
+        value = (self.m * raw + self.b * 10 ** self.b_exp) * 10 ** self.r_exp
+        lin = _SDR_LINEARIZATION.get(self.linearization)
+        return lin(value) if lin else None
+
+
+class NativeIpmi:
+    """iDRAC backend over our own RMCP+ client: one persistent session,
+    re-established transparently when it goes stale (iDRAC reset, idle
+    timeout, network blip)."""
+
+    BMC_ADDR = 0x20
+    SENSOR_TYPE_TEMPERATURE = 0x01
+    # iDRAC drops idle IPMI sessions after a while; rather than probe a
+    # possibly-dead session (and eat a timeout), re-login if we've been
+    # quiet longer than this. Polls are normally far more frequent.
+    MAX_IDLE = 30.0
+
+    def __init__(self, host, user, password, port=623, cipher_suite=None, kg=None):
+        self._args = (host, user, password, port, kg)
+        # None = try 3 (iDRAC 7/8) and fall back to 17 (newer firmware).
+        self._suites = [cipher_suite] if cipher_suite else [3, 17]
+        self._session = None
+        self._last_used = 0.0
+        self._lock = threading.Lock()
+        self._sensors = None           # {sensor_id: SdrSensor}, read once
+        self._warned_missing = set()
+        self.logins = 0
+
+    def _connect(self, reason=None):
+        host, user, password, port, kg = self._args
+        last = None
+        for suite in self._suites:
+            s = RmcpPlusSession(host, user, password, port=port, cipher_suite=suite, kg=kg)
+            try:
+                s.open()
+            except IpmiError as e:
+                # Only a cipher-suite mismatch is worth retrying with the next suite.
+                if e.code in (0x04, 0x05, 0x10, 0x11) and suite != self._suites[-1]:
+                    last = e
+                    continue
+                raise
+            self.logins += 1
+            if reason:
+                log(f"IPMI session re-established after {reason} (login #{self.logins}).",
+                    level="WARNING")
+            if len(self._suites) > 1:
+                self._suites = [suite]  # remember what works
+            return s
+        raise last
+
+    def _cmd(self, netfn, cmd, data=(), lun=0):
+        with self._lock:
+            now = time.monotonic()
+            if self._session is not None and now - self._last_used > self.MAX_IDLE:
+                self._session.close()
+                self._session = None
+            fresh = self._session is None
+            if fresh:
+                self._session = self._connect()
+            try:
+                rsp = self._session.command(netfn, cmd, data, lun)
+            except IpmiTimeout:
+                # The session may have died under us (iDRAC reset drops all
+                # sessions). Log in again once and retry before giving up.
+                self._session.close(graceful=False)
+                self._session = None
+                if fresh:
+                    raise
+                self._session = self._connect("a timeout")
+                rsp = self._session.command(netfn, cmd, data, lun)
+            self._last_used = time.monotonic()
+            return rsp
+
+    def close(self):
+        with self._lock:
+            if self._session is not None:
+                self._session.close()
+                self._session = None
+
+    # -- the backend interface --------------------------------------------
+
+    def set_manual_mode(self):
+        self._cmd(0x30, 0x30, [0x01, 0x00])
+
+    def set_auto_mode(self):
+        self._cmd(0x30, 0x30, [0x01, 0x01])
+
+    def set_fan_speed(self, percent):
+        self._cmd(0x30, 0x30, [0x02, 0xFF, max(0, min(100, int(percent)))])
+
+    def _read_sdr_record(self, record_id, chunk):
+        """Return (next_record_id, record_bytes), shrinking the read size
+        if the BMC can't return as much as we asked for."""
+        while True:
+            res = self._cmd(0x0A, 0x22)[:2]          # Reserve SDR Repository
+            try:
+                hdr = self._cmd(0x0A, 0x23, res + struct.pack("<HBB", record_id, 0, 5))
+                next_id = struct.unpack_from("<H", hdr)[0]
+                rec = bytearray(hdr[2:7])
+                total = 5 + rec[4]
+                while len(rec) < total:
+                    n = min(chunk[0], total - len(rec))
+                    try:
+                        part = self._cmd(0x0A, 0x23, res + struct.pack("<HBB", record_id,
+                                                                       len(rec), n))
+                    except IpmiError as e:
+                        if e.code in (0xCA, 0xC7, 0xFF) and chunk[0] > 4:
+                            chunk[0] //= 2
+                            continue
+                        raise
+                    rec += part[2:]
+                return next_id, bytes(rec[:total])
+            except IpmiError as e:
+                if e.code == 0xC5:   # reservation lost (someone else read the SDR); retry
+                    continue
+                raise
+
+    def load_sensors(self):
+        """Walk the SDR repository once, keeping BMC-owned temperature
+        sensors. The SDR is static, so this survives reconnects."""
+        sensors, record_id, chunk, seen = {}, 0x0000, [16], 0
+        while record_id != 0xFFFF and seen < 1024:
+            next_id, rec = self._read_sdr_record(record_id, chunk)
+            seen += 1
+            if (len(rec) >= 48 and rec[3] == 0x01 and rec[5] == self.BMC_ADDR
+                    and rec[12] == self.SENSOR_TYPE_TEMPERATURE):
+                s = SdrSensor(rec)
+                sensors.setdefault(s.sensor_id, s)
+            if next_id == record_id:
+                break
+            record_id = next_id
+        self._sensors = sensors
+        return sensors
+
+    def read_sensor(self, sensor):
+        """Converted reading, or None if the sensor has no valid reading."""
+        try:
+            rsp = self._cmd(0x04, 0x2D, [sensor.number], lun=sensor.lun)
+        except IpmiError as e:
+            if e.code in (0xCB, 0xCD, 0xD5):
+                return None
+            raise
+        if len(rsp) < 2 or rsp[1] & 0x20 or not rsp[1] & 0x40:
+            return None   # reading unavailable / scanning disabled
+        return sensor.convert(rsp[0])
+
+    def read_temps(self, sensor_ids):
+        if self._sensors is None:
+            self.load_sensors()
+        readings = {}
+        for sid in sensor_ids:
+            sensor = self._sensors.get(normalize_sensor_id(sid))
+            if sensor is None:
+                if sid not in self._warned_missing:
+                    self._warned_missing.add(sid)
+                    found = ", ".join(f"{k.upper()} ({v.name})" for k, v in
+                                      sorted(self._sensors.items())) or "none"
+                    log(f"Sensor {sid} is not a temperature sensor in the iDRAC's SDR. "
+                        f"Available: {found}", level="WARNING")
+                continue
+            value = self.read_sensor(sensor)
+            if value is not None:
+                readings[sid] = int(round(value))
+        return readings
+
+
+def normalize_sensor_id(sid):
+    """'0Eh', '0x0e', '0e', '14' (hex) -> '0eh', the form ipmitool prints."""
+    s = sid.strip().lower()
+    s = s[2:] if s.startswith("0x") else s
+    s = s[:-1] if s.endswith("h") else s
+    try:
+        return f"{int(s, 16):02x}h"
+    except ValueError:
+        return sid.strip().lower()
+
+
+class IpmitoolIpmi:
+    """Fallback backend (--ipmi-backend ipmitool): shells out to ipmitool,
+    which opens and tears down a full RMCP+ session for every command."""
+
+    def __init__(self, host, user, password, port=623, interface="lanplus"):
         self.host = host
+        self.port = port
         self.user = user
         self.interface = interface
         # Password goes to ipmitool via its environment (-E), keeping it
@@ -354,7 +1014,7 @@ class IdracIpmi:
     def _run(self, args, timeout=15):
         cmd = [
             "ipmitool", "-I", self.interface,
-            "-H", self.host, "-U", self.user, "-E",
+            "-H", self.host, "-p", str(self.port), "-U", self.user, "-E",
         ] + args
         result = subprocess.run(cmd, capture_output=True, text=True,
                                 timeout=timeout, env=self._env)
@@ -390,10 +1050,13 @@ class IdracIpmi:
             sensor_id = parts[1].lower()
             if sensor_id not in wanted:
                 continue
-            m = re.search(r"(-?\d+)\s*degrees", parts[-1], re.IGNORECASE)
+            m = re.search(r"(-?\d+(?:\.\d+)?)\s*degrees", parts[-1], re.IGNORECASE)
             if m:
-                readings[sensor_id] = int(m.group(1))
+                readings[sensor_id] = int(round(float(m.group(1))))
         return readings
+
+    def close(self):
+        pass
 
 
 class DemoIpmi:
@@ -414,6 +1077,9 @@ class DemoIpmi:
 
     def set_fan_speed(self, percent):
         self.fan_speed = float(max(0, min(100, int(percent))))
+
+    def close(self):
+        pass
 
     def read_temps(self, sensor_ids):
         if not self._temps:
@@ -525,7 +1191,7 @@ def run_loop(ipmi, controller, state, sensor_ids, max_failed_polls):
             if not readings:
                 raise RuntimeError(
                     f"no readings for sensors {sensor_ids} -- check IDs with "
-                    f"'ipmitool sdr type Temperature'")
+                    f"--list-sensors")
 
             if failsafe:
                 log("Polling recovered. Re-engaging manual fan control.", level="WARNING")
@@ -1350,6 +2016,31 @@ poll();
 # Entry point
 # ---------------------------------------------------------------------------
 
+def list_sensors(ipmi):
+    """--list-sensors: print temperature sensors and exit. Returns an exit code."""
+    if isinstance(ipmi, IpmitoolIpmi):
+        print(ipmi._run(["sdr", "type", "Temperature"]), end="")
+        return 0
+    if isinstance(ipmi, DemoIpmi):
+        print("--list-sensors needs a real iDRAC (not --demo).", file=sys.stderr)
+        return 1
+    try:
+        sensors = ipmi.load_sensors()
+        print(f"{'ID':<5} {'Name':<17} Reading")
+        for sid, sensor in sorted(sensors.items()):
+            value = ipmi.read_sensor(sensor)
+            shown = "no reading" if value is None else f"{value:g} C"
+            print(f"{sid[:-1].upper() + 'h':<5} {sensor.name:<17} {shown}")
+        if not sensors:
+            print("(no temperature sensors found in the SDR repository)")
+        return 0
+    except Exception as e:
+        print(f"Failed to list sensors: {e}", file=sys.stderr)
+        return 1
+    finally:
+        ipmi.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Custom software fan control loop for iDRAC "
@@ -1360,6 +2051,23 @@ def main():
     parser.add_argument("--password", default=DEFAULT_PASSWORD,
                         help="iDRAC password. Prefer the IPMI_PASSWORD environment "
                              "variable, which keeps it out of process listings.")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
+                        help=f"iDRAC IPMI-over-LAN UDP port (default: {DEFAULT_PORT})")
+    parser.add_argument("--ipmi-backend", choices=("native", "ipmitool"),
+                        default=DEFAULT_IPMI_BACKEND,
+                        help="native: built-in IPMI client holding one persistent "
+                             "session (no ipmitool needed). ipmitool: run ipmitool for "
+                             "every command, logging in each time. "
+                             f"(default: {DEFAULT_IPMI_BACKEND})")
+    parser.add_argument("--cipher-suite", type=int, choices=(3, 17), default=None,
+                        help="Native backend only: RMCP+ cipher suite. Default tries 3 "
+                             "(iDRAC 7/8) and falls back to 17 if the iDRAC rejects it.")
+    parser.add_argument("--list-sensors", action="store_true",
+                        help="Print the iDRAC's temperature sensors (IDs, names, current "
+                             "readings) and exit, without touching fan control")
+    parser.add_argument("--revert-to-auto", action="store_true",
+                        help="Hand fan control back to the iDRAC's automatic mode and "
+                             "exit (for a systemd ExecStopPost backstop)")
     parser.add_argument("--demo", action="store_true",
                         help="Run against a simulated iDRAC (no credentials needed); "
                              "useful for previewing the web UI and tuning parameters")
@@ -1436,7 +2144,24 @@ def main():
         if not password:
             parser.error("no password: pass --password or set the IPMI_PASSWORD "
                          "environment variable (preferred)")
-        ipmi = IdracIpmi(args.host, args.user, password)
+        if args.ipmi_backend == "native":
+            ipmi = NativeIpmi(args.host, args.user, password, port=args.port,
+                              cipher_suite=args.cipher_suite)
+        else:
+            ipmi = IpmitoolIpmi(args.host, args.user, password, port=args.port)
+
+    if args.list_sensors:
+        sys.exit(list_sensors(ipmi))
+    if args.revert_to_auto:
+        try:
+            ipmi.set_auto_mode()
+            log("Reverted to automatic iDRAC fan control.")
+        except Exception as e:
+            log(f"Revert to automatic fan control failed: {e}", level="CRITICAL")
+            sys.exit(1)
+        finally:
+            ipmi.close()
+        sys.exit(0)
 
     sensor_ids = [s.strip().lower() for s in args.sensors.split(",") if s.strip()]
     settings_path = args.settings_file or os.path.join(
@@ -1530,6 +2255,7 @@ def main():
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         if engaged:
             cleanup(ipmi, args.revert_on_exit, args.exit_speed)
+        ipmi.close()
 
 
 if __name__ == "__main__":

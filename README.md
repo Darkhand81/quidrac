@@ -17,8 +17,7 @@ so a bug or network drop can't cook the machine.
 
 ## Requirements
 
-- Python 3.8+ (standard library only — no pip packages)
-- `ipmitool`
+- Python 3.8+ (standard library only — no pip packages, no `ipmitool`)
 - A Dell server with iDRAC and **IPMI over LAN enabled**
   (iDRAC Settings → Network → IPMI Settings)
 - Tested against iDRAC generations that support the `0x30 0x30` raw fan
@@ -37,10 +36,10 @@ export IPMI_PASSWORD='yourpassword'
 
 Then open `http://<machine-running-quidrac>:8080/` for the dashboard.
 
-Find your temperature sensor IDs with:
+Find your temperature sensor IDs (this is also a good first connection test):
 
 ```sh
-ipmitool -I lanplus -H <idrac-ip> -U root -E sdr type Temperature
+./quidrac.py --host 192.168.1.100 --user root --list-sensors
 ```
 
 and pass them as `--sensors "0Eh,0Fh"` (the defaults are the two CPU package
@@ -118,6 +117,22 @@ What you'll see on the chart:
   poll. There is deliberately zero lag in that direction, so spike response
   and the hard-cap jump are unaffected.
 
+### Talking to the iDRAC
+
+quidrac has its own IPMI 2.0 / RMCP+ client built in: the same protocol
+`ipmitool -I lanplus` speaks (cipher suite 3: HMAC-SHA1 authentication,
+HMAC-SHA1-96 integrity, AES-128 encryption; suite 17 as a fallback). It logs in
+once and keeps that session for every poll. Running `ipmitool` per command
+does a complete login handshake for every command, three per poll, which is
+~26,000 logins a day at the default interval.
+
+If the session dies (iDRAC reset, network drop), the next command times out,
+quidrac logs in again and retries it, so a reset costs one slow poll rather
+than a failed one. A session left idle for more than 30 s (long
+`--poll-interval`s) is replaced rather than trusted. `--ipmi-backend ipmitool`
+switches back to shelling out to `ipmitool` for every command, should the
+built-in client ever disagree with your firmware.
+
 ## Safety / failure handling
 
 Because quidrac replaces the iDRAC's own algorithm, it's built to fail toward
@@ -184,7 +199,12 @@ returns to the launch configuration (defaults + flags) and deletes the file.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--host` / `--user` / `--password` | — | iDRAC connection. Prefer the `IPMI_PASSWORD` env var over `--password` (keeps it out of `ps`; it's passed to ipmitool via environment either way) |
+| `--host` / `--user` / `--password` | — | iDRAC connection. Prefer the `IPMI_PASSWORD` env var over `--password` (keeps it out of `ps`) |
+| `--port` | 623 | iDRAC IPMI-over-LAN UDP port |
+| `--ipmi-backend` | `native` | `native`: built-in client, one persistent session. `ipmitool`: run `ipmitool` per command (password passed via its environment) |
+| `--cipher-suite` | auto | Native backend: force RMCP+ cipher suite `3` or `17` (auto tries 3, then 17) |
+| `--list-sensors` | — | Print the iDRAC's temperature sensor IDs, names and readings, then exit |
+| `--revert-to-auto` | — | Hand fan control back to the iDRAC and exit (systemd backstop) |
 | `--sensors` | `0Eh,0Fh` | Comma-separated sensor IDs to monitor |
 | `--sensor-aliases` | from script | Friendly names, e.g. `"0Eh=CPU1,0Fh=CPU2"` |
 | `--base-speed` | 30 | Minimum fan %, used at/below target temp |
@@ -214,8 +234,7 @@ Wants=network-online.target
 Environment=IPMI_PASSWORD=yourpassword
 ExecStart=/usr/local/bin/quidrac.py --host 192.168.1.100 --user root
 # Backstop: revert to automatic fan control however the unit stops.
-ExecStopPost=/usr/bin/ipmitool -I lanplus -H 192.168.1.100 -U root -E \
-    raw 0x30 0x30 0x01 0x01
+ExecStopPost=/usr/local/bin/quidrac.py --host 192.168.1.100 --user root --revert-to-auto
 Restart=always
 RestartSec=5
 
