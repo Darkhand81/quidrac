@@ -245,6 +245,15 @@ WantedBy=multi-user.target
 (Consider `chmod 600` on the unit file, or use an `EnvironmentFile`, since it
 contains the iDRAC password.)
 
+The `ExecStopPost` backstop runs every time the unit stops, clean stops
+included, so it always hands fan control back to the iDRAC. That overrides
+`--no-revert-on-exit` and `--exit-speed`: whatever speed quidrac held or left
+on exit, the backstop switches to automatic mode right after. If you want the
+fans to stay where quidrac left them (`--exit-speed current`) or at a fixed
+`--exit-speed`, leave out the `ExecStopPost` line. You then lose the
+protection it gives when quidrac can't clean up after itself (SIGKILL, the
+OOM killer, a hang that systemd kills).
+
 ## Disclaimer
 
 quidrac drives your server's cooling. The defaults are conservative for
